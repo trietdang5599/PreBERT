@@ -106,7 +106,7 @@ def run(file_path, n_factors, checkpoint_path, sparse_matrix_path):
         encoded_features = load_npz(sparse_matrix_path)
 
     X = encoded_features.astype(np.float64)
-    y = df['overall'].apply(lambda x: 1 if x >= 4 else -1).values
+    y = df['overall'].values
 
 
     feature_names = encoder.get_feature_names_out(['reviewerID', 'itemID'])
