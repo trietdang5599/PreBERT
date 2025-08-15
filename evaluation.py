@@ -8,7 +8,6 @@ from helper.utils import csv_to_dataloader, read_data
 from train import DeepBERT, test, test_rsme, train_deepbert
 
 
-# from model.DeepCGSR.train import train
 
 class EarlyStopper(object):
 
@@ -30,7 +29,6 @@ class EarlyStopper(object):
         else:
             return False
 
-# Hàm để tạo DataLoader cho các tập train, validation, test
 def create_dataloaders(json_file, batch_size=32, train_ratio=0.7, valid_ratio=0.2, test_ratio=0.1):
     dataset = read_data(json_file)
     total_size = len(dataset)
@@ -47,7 +45,6 @@ def create_dataloaders(json_file, batch_size=32, train_ratio=0.7, valid_ratio=0.
     
     return train_loader, valid_loader, test_loader
 
-# Chia dữ liệu thành các DataFrame (train, validation, test)
 def create_dataframes(json_file, train_ratio=0.7, valid_ratio=0.1, test_ratio=0.2):
     data = read_data(json_file)
     df = pd.DataFrame(data, columns=['reviewerID', 'asin', 'overall', 'overall_new', 'reviewText', 'filteredReviewText'])
