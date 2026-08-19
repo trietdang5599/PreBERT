@@ -1,8 +1,7 @@
 import torch
 
 def get_coarse_sentiment_score(model, tokenizer, text):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
+    device = next(model.parameters()).device
     inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512).to(device)
 
     with torch.no_grad():
@@ -19,4 +18,3 @@ def get_coarse_sentiment_score(model, tokenizer, text):
     sentiment_score = lower_bound + highest_prob * (upper_bound - lower_bound)
     
     return sentiment_score
-

@@ -1,13 +1,11 @@
 import os
-import string
 import ast
 import re
 import csv
-import ast
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from nltk import word_tokenize
-from nltk.corpus import stopwords
+from nltk.tokenize import wordpunct_tokenize
 import openpyxl
 
 
@@ -31,6 +29,7 @@ def split_text(text, max_length=300):
 
 def create_and_write_csv(file_name, data):   
     dictory_path = "feature"
+    Path(dictory_path).mkdir(parents=True, exist_ok=True)
     filename = os.path.join(dictory_path, file_name + '.csv')
     with open(filename, mode='w', newline='') as file:
         writer = csv.writer(file)
@@ -57,15 +56,20 @@ def load_data_from_csv(file_path):
     return data
 
 def parse_array_from_string(array_string):
-    try:
-        if isinstance(array_string, (int, float)):
-            return [float(array_string)]
-
-        array_string = array_string.strip()
-        array_string = re.sub(r'(?<![\d.])e[\d.]+', '', array_string)
-        return ast.literal_eval(array_string)
-    except (ValueError, SyntaxError):
+    if isinstance(array_string, (int, float)):
+        return [float(array_string)]
+    if not isinstance(array_string, str):
         return []
+
+    # Feature CSVs contain NumPy's representation (space/newline separated,
+    # without commas), while some older files contain normal Python lists.
+    content = array_string.strip().strip("[]").replace(",", " ")
+    if not content:
+        return []
+    values = np.fromstring(content, sep=" ", dtype=np.float32)
+    if values.size:
+        return values.tolist()
+    return []
     
 def read_csv_file(csv_file):
     keys = []
@@ -97,16 +101,15 @@ def sigmoid(x):
     s = 1 / (1 + np.exp(-x))
     return s
 
-stop_words = stopwords.words("english") + list(string.punctuation)
 def word_segment(text):
     if pd.isnull(text):
         return [] 
-    word_seg = word_tokenize(str(text).lower()) 
+    word_seg = wordpunct_tokenize(str(text).lower())
     
     return word_seg
 
 def preprocessed(text):
-    return text.split("\.")
+    return text.split(".")
 
 def clean_text(text):
     text = re.sub(r'\.{2,}', ' ', text)
@@ -122,6 +125,7 @@ def convert_string_to_float_list(string):
         return np.array([])
 
 def save_to_excel(values, headers, output_path):
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     if os.path.exists(output_path):
         workbook = openpyxl.load_workbook(output_path)
         sheet = workbook.active

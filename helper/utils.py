@@ -1,15 +1,13 @@
 import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import nltk
 from sklearn.calibration import LabelEncoder
 import torch
-import json
 from torch.utils.data import DataLoader, TensorDataset
 
 from helper.general_functions import format_array, parse_array_from_string
-nltk.download('punkt')
-nltk.download('stopwords')
 
 
 def read_data(file_path):
@@ -30,7 +28,7 @@ def read_data(file_path):
                 pass
     return data
 
-def csv_to_dataloader(csv_link, batch_size, shuffle=True):
+def csv_to_dataloader(csv_link, batch_size, shuffle=True, num_workers=0):
     df = pd.read_csv(csv_link)
 
     df['Udeep'] = df['Udeep'].apply(parse_array_from_string)
@@ -48,7 +46,12 @@ def csv_to_dataloader(csv_link, batch_size, shuffle=True):
     userbias_tensor = torch.tensor(df['user_bias'].values, dtype=torch.float32)
     
     dataset = TensorDataset(reviewerID_tensor, itemID_tensor, overall_tensor, Udeep_tensor, Ideep_tensor, itembias_tensor, userbias_tensor)
-    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=8, shuffle=shuffle)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle,
+    )
     
     return dataloader
 
@@ -74,10 +77,14 @@ def encode_and_save_csv(df, output_path, columns_to_encode):
     for column in columns_to_encode:
         label_encoders[column] = LabelEncoder()
         df[column] = label_encoders[column].fit_transform(df[column])
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)
     return label_encoders
 
 def setup_path():
+    for directory in ("feature", "data", "chkpt", "results"):
+        Path(directory).mkdir(parents=True, exist_ok=True)
+
     allreviews_path = "feature/allFeatureReview_"
     reviewer_path = "feature/reviewer_feature_"
     item_path = "feature/item_feature_"
@@ -91,7 +98,3 @@ def setup_path():
     sparse_matrix_path = 'chkpt/encoded_features_'
     
     return allreviews_path, reviewer_path, item_path, udeep_path, ideep_path, tranformed_udeep_path, tranformed_ideep_path, final_data_path, svd_path, checkpoint_path, sparse_matrix_path
-
-if __name__ == "__main__":
-    import nltk
-    nltk.download('averaged_perceptron_tagger')

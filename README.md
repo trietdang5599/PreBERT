@@ -14,4 +14,12 @@ In summary, the contributions of this work are threefold:
 
 In this study, we use Stanford CoreNLP. Please make sure the device has the required model installed and that `JAVA_HOME` is set up properly on the device.
 
-After that, run the `requirements.txt` file to install the necessary dependencies. Finally, execute the `evaluation.py` file to evaluate the model. The source code includes the extracted review text feature from the <b>All Beauty Amazon</b> dataset.
+After that, install `requirements.txt` and use the mode-based experiment
+launchers. For example, run the main PreBERT result with:
+
+```bash
+./scripts/run_prebert.sh main
+```
+
+Main results, ablations, LLM evaluation, and semantic-retention commands are
+documented in [EXPERIMENTS.md](EXPERIMENTS.md).

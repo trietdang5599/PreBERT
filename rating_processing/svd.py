@@ -1,113 +1,170 @@
-import os
-import pandas as pd
+"""Train-only matrix factorization with validation-based early stopping."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
 import numpy as np
-import scipy.sparse as sparse
+import pandas as pd
 import torch
 
-class SVD():
-    def __init__(self, data_path, num_factors):
+
+class SVD:
+    """Biased-free matrix factorization used to produce user/item embeddings.
+
+    Despite the historical class name, this model is optimized with gradient
+    descent rather than a closed-form singular-value decomposition.
+    """
+
+    def __init__(self, data_path: str | Path, num_factors: int, seed: int = 42):
         self.df = pd.read_csv(data_path)
-        self.users = sorted(self.df['reviewerID'].unique())
-        self.items = sorted(self.df['itemID'].unique())
+        self.df["reviewerID"] = self.df["reviewerID"].astype(str)
+        self.df["itemID"] = self.df["itemID"].astype(str)
+        self.users = sorted(self.df["reviewerID"].unique())
+        self.items = sorted(self.df["itemID"].unique())
+        self.users_id_dict = {value: index for index, value in enumerate(self.users)}
+        self.items_id_dict = {value: index for index, value in enumerate(self.items)}
 
-        self.users_id_dict = {u: index for index, u in enumerate(self.users)}
-        self.items_id_dict = {i: index for index, i in enumerate(self.items)}
-
-        self.rows = []
-        self.cols = []
-        self.data = []
-
-        self.beta = 0.9
-        self.lmbda = 0.0002
+        self.rows = self.df["reviewerID"].map(self.users_id_dict).to_numpy()
+        self.cols = self.df["itemID"].map(self.items_id_dict).to_numpy()
+        self.data = self.df["overall"].to_numpy(dtype=np.float64)
         self.k = num_factors
-        self.learning_rate = 0.01
+        self.learning_rate = 0.03
+        self.regularization = 0.002
         self.iterations = 1000
-        self.u_dim = len(self.users)
-        self.i_dim = len(self.items)
+        self.seed = seed
+        self.global_mean = float(np.mean(self.data))
 
-        self._init_ratings_matrix()
+    def _create_embeddings(self, count: int, rng: np.random.Generator) -> np.ndarray:
+        return rng.normal(0.0, 0.1 / np.sqrt(self.k), size=(count, self.k))
 
-    def _init_ratings_matrix(self):
-        for item in self.df.itertuples():
-            r = item[3]
-            u = item[1]
-            i = item[2]
-            iu = self.users_id_dict[u]
-            ii = self.items_id_dict[i]
-            self.rows.append(iu)
-            self.cols.append(ii)
-            self.data.append(r)
-        
-        ratings = np.zeros((self.u_dim, self.i_dim))
-        for r, c, d in zip(self.rows, self.cols, self.data):
-            ratings[r, c] = d
+    def _observed_predictions(
+        self, emb_user: np.ndarray, emb_item: np.ndarray
+    ) -> np.ndarray:
+        return np.sum(emb_user[self.rows] * emb_item[self.cols], axis=1)
 
-        self.ratings = ratings
-        self.sparse_ratings = self._create_sparse_matrix(self.data, self.u_dim, self.i_dim)
+    def _train_rmse(self, emb_user: np.ndarray, emb_item: np.ndarray) -> float:
+        predictions = self._observed_predictions(emb_user, emb_item)
+        return float(np.sqrt(np.mean((self.data - predictions) ** 2)))
 
-    def _create_sparse_matrix(self, data, len_user, len_item):
-        return sparse.csc_matrix((data, (self.rows, self.cols)), shape=(len_user, len_item))
+    def _validation_rmse(
+        self,
+        frame: pd.DataFrame,
+        emb_user: np.ndarray,
+        emb_item: np.ndarray,
+    ) -> float:
+        predictions = np.full(len(frame), self.global_mean, dtype=np.float64)
+        for position, row in enumerate(frame.itertuples(index=False)):
+            user_index = self.users_id_dict.get(str(row.reviewerID))
+            item_index = self.items_id_dict.get(str(row.itemID))
+            if user_index is not None and item_index is not None:
+                predictions[position] = np.dot(
+                    emb_user[user_index], emb_item[item_index]
+                )
+        ratings = frame["overall"].to_numpy(dtype=np.float64)
+        return float(np.sqrt(np.mean((ratings - predictions) ** 2)))
 
-    def _create_embeddings(self, n):
-        return 6 * np.random.random((n, self.k)) / self.k
+    def train(
+        self,
+        validation_data: pd.DataFrame | None = None,
+        *,
+        eval_every: int = 10,
+        patience: int = 10,
+    ) -> None:
+        rng = np.random.default_rng(self.seed)
+        emb_user = self._create_embeddings(len(self.users), rng)
+        emb_item = self._create_embeddings(len(self.items), rng)
+        user_counts = np.maximum(
+            np.bincount(self.rows, minlength=len(self.users)), 1
+        )[:, None]
+        item_counts = np.maximum(
+            np.bincount(self.cols, minlength=len(self.items)), 1
+        )[:, None]
 
-    def _predict(self, emb_user, emb_item):
-        return np.dot(emb_user, emb_item.T)
+        best_metric = np.inf
+        best_embeddings: tuple[np.ndarray, np.ndarray] | None = None
+        stale_evaluations = 0
 
-    def _cost(self, emb_user, emb_item):
-        p_predict = self._predict(emb_user, emb_item)
-        p_data = [p_predict[r][c] for r, c in zip(self.rows, self.cols)]
-        predicted = self._create_sparse_matrix(p_data, emb_user.shape[0], emb_item.shape[0])
-        return np.sum((self.sparse_ratings - predicted).power(2)) / len(self.data)
+        for iteration in range(1, self.iterations + 1):
+            predictions = self._observed_predictions(emb_user, emb_item)
+            errors = predictions - self.data
+            grad_user = np.zeros_like(emb_user)
+            grad_item = np.zeros_like(emb_item)
+            np.add.at(grad_user, self.rows, errors[:, None] * emb_item[self.cols])
+            np.add.at(grad_item, self.cols, errors[:, None] * emb_user[self.rows])
+            grad_user = grad_user / user_counts + self.regularization * emb_user
+            grad_item = grad_item / item_counts + self.regularization * emb_item
+            np.clip(grad_user, -5.0, 5.0, out=grad_user)
+            np.clip(grad_item, -5.0, 5.0, out=grad_item)
+            emb_user -= self.learning_rate * grad_user
+            emb_item -= self.learning_rate * grad_item
 
-    def _gradient(self, emb_user, emb_item):
-        p_predict = self._predict(emb_user, emb_item)
-        p_data = [p_predict[r][c] for r, c in zip(self.rows, self.cols)]
-        sparse_predicted = self._create_sparse_matrix(p_data, emb_user.shape[0], emb_item.shape[0])
-        delta = self.sparse_ratings - sparse_predicted
+            if iteration % eval_every != 0:
+                continue
+            train_rmse = self._train_rmse(emb_user, emb_item)
+            metric = train_rmse
+            message = f"SVD iteration {iteration}: train RMSE={train_rmse:.6f}"
+            if validation_data is not None and len(validation_data):
+                metric = self._validation_rmse(validation_data, emb_user, emb_item)
+                message += f", valid RMSE={metric:.6f}"
+            print(message)
 
-        grad_user = (-2 / self.df.shape[0]) * (delta @ emb_item) + 2 * self.lmbda * emb_user
-        grad_item = (-2 / self.df.shape[0]) * (delta.T @ emb_user) + 2 * self.lmbda * emb_item
-        return grad_user, grad_item
+            if metric < best_metric - 1e-6:
+                best_metric = metric
+                best_embeddings = (emb_user.copy(), emb_item.copy())
+                stale_evaluations = 0
+            else:
+                stale_evaluations += 1
+                if validation_data is not None and stale_evaluations >= patience:
+                    print(f"SVD early stopped at iteration {iteration}")
+                    break
 
-    def train(self):
-        emb_user = self._create_embeddings(self.u_dim)
-        emb_item = self._create_embeddings(self.i_dim)
-        v_user = np.zeros_like(emb_user)
-        v_item = np.zeros_like(emb_item)
+        if best_embeddings is None:
+            best_embeddings = (emb_user, emb_item)
+        self.emb_user, self.emb_item = best_embeddings
+        self.best_metric = best_metric
 
-        for i in range(self.iterations):
-            grad_user, grad_item = self._gradient(emb_user, emb_item)
-            v_user = self.beta * v_user + (1 - self.beta) * grad_user 
-            v_item = self.beta * v_item + (1 - self.beta) * grad_item
-            emb_user -= self.learning_rate * v_user
-            emb_item -= self.learning_rate * v_item
+    def get_embeddings(self) -> tuple[np.ndarray, np.ndarray]:
+        if not hasattr(self, "emb_user"):
+            raise RuntimeError("SVD must be trained before requesting embeddings")
+        return self.emb_user, self.emb_item
 
-            if (i + 1) % 50 == 0:
-                print(f"\nIteration {i + 1}:")
+    def get_user_embedding(self, user_id: Any) -> np.ndarray:
+        index = self.users_id_dict.get(str(user_id))
+        if index is None:
+            return np.mean(self.emb_user, axis=0)
+        return self.emb_user[index]
 
-        self.emb_user = emb_user
-        self.emb_item = emb_item
+    def get_item_embedding(self, item_id: Any) -> np.ndarray:
+        index = self.items_id_dict.get(str(item_id))
+        if index is None:
+            return np.mean(self.emb_item, axis=0)
+        return self.emb_item[index]
 
-    def get_embeddings(self):
-        if hasattr(self, 'emb_user'):
-            return self.emb_user, self.emb_item
-        else:
-            raise Exception('Please train the model first.')
 
-    def get_user_embedding(self, user_id):
-        index = self.users_id_dict[user_id]
-        return self.emb_user[index, :]
+def initialize_svd(
+    data_path: str | Path,
+    num_factors: int,
+    checkpoint_path: str | Path = "chkpt/svd_train.pt",
+    validation_data: pd.DataFrame | None = None,
+) -> SVD:
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.exists():
+        svd = torch.load(checkpoint_path, weights_only=False)
+        if svd.k != num_factors:
+            raise ValueError(
+                f"SVD checkpoint has {svd.k} factors, expected {num_factors}"
+            )
+        current = pd.read_csv(data_path)
+        current_users = set(current["reviewerID"].astype(str))
+        current_items = set(current["itemID"].astype(str))
+        if current_users != set(svd.users) or current_items != set(svd.items):
+            raise ValueError("SVD checkpoint was fitted on a different train split")
+        return svd
 
-    def get_item_embedding(self, item_id):
-        index = self.items_id_dict[item_id]
-        return self.emb_item[index, :]
-
-def initialize_svd(data_path, num_factors, checkpoint_path='model/DeepCGSR/chkpt/svd.pt'):
-    if os.path.exists(checkpoint_path):
-        svd = torch.load(checkpoint_path)
-    else:
-        svd = SVD(data_path, num_factors)
-        svd.train()
-        torch.save(svd, checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    svd = SVD(data_path, num_factors)
+    svd.train(validation_data=validation_data)
+    torch.save(svd, checkpoint_path)
     return svd

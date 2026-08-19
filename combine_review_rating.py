@@ -6,10 +6,19 @@ from helper.general_functions import create_and_write_csv, read_csv_file
 #============================ Calulate U/I deep ===============================
 
 def Calculate_Deep(v, z):
-    v_z = v * z
-    v2_z2 = (v**2) * (z**2)
-    result = (1 / 2) * ((v_z)**2 - v2_z2)
-    return result
+    """Fuse review/rating features with the FM embedding.
+
+    The previous expression computed ``0.5 * ((v*z)^2 - v^2*z^2)``, which is
+    identically zero. A Hadamard interaction preserves one value per latent
+    factor and is compatible with the downstream prediction layer.
+    """
+    v_array = np.asarray(v, dtype=np.float32)
+    z_array = np.asarray(z, dtype=np.float32)
+    if v_array.shape != z_array.shape:
+        raise ValueError(
+            f"Cannot fuse feature vectors with shapes {v_array.shape} and {z_array.shape}"
+        )
+    return v_array * z_array
 
 
 def mergeReview_Rating(path, filename, svd, reviewer_feature_dict, item_feature_dict, getEmbedding):
@@ -31,7 +40,6 @@ def mergeReview_Rating(path, filename, svd, reviewer_feature_dict, item_feature_
         rating_feature_list.append(B)
     create_and_write_csv(filename, feature_dict)
     return feature_dict
-
 
 
 

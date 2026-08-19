@@ -5,4 +5,14 @@ config/stanford-parser-full-2020-11-17/stanford-parser-4.2.0-models.jar
 chkpt/
 backup/
 results/
+exp_llm/outputs/
+exp_llm/tests/
+exp_llm/eval_outputs/
+exp_llm/semantic_outputs/
+exp_llm/backup_outputs/
 __pycache__/
+config/.DS_Store
+.DS_Store
+feature.zip
+exp_llm/__main__.py
+exp_llm/__init__.py
