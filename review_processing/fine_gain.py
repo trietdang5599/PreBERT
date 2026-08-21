@@ -118,6 +118,7 @@ def fine_tune_bert(
     validation_labels=None,
     model_name_or_path="answerdotai/ModernBERT-base",
     fine_tune=True,
+    balance_classes=True,
 ):
     device = get_device()
     print(f"Using device: {device}")
@@ -159,6 +160,12 @@ def fine_tune_bert(
             raise RuntimeError(
                 f"Checkpoint encoder is {checkpoint_model}, requested "
                 f"{model_name_or_path}; use a separate cache or force BERT retraining"
+            )
+        checkpoint_balanced = checkpoint.get("class_balanced", False)
+        if checkpoint_balanced != balance_classes:
+            raise RuntimeError(
+                "Checkpoint class-balancing policy does not match this run; "
+                "use a separate cache or force BERT retraining"
             )
         config = AutoConfig.from_pretrained(
             model_name_or_path,
@@ -205,6 +212,23 @@ def fine_tune_bert(
     model = model.to(device) 
 
     optimizer = AdamW(model.parameters(), lr=learning_rate)
+    criterion = None
+    if balance_classes:
+        label_counts = torch.bincount(
+            torch.as_tensor(labels, dtype=torch.long), minlength=num_labels
+        ).float()
+        class_weights = torch.zeros_like(label_counts)
+        present = label_counts > 0
+        class_weights[present] = len(labels) / (
+            present.sum() * label_counts[present]
+        )
+        criterion = torch.nn.CrossEntropyLoss(
+            weight=class_weights.to(device)
+        )
+        print(
+            "BERT class-balanced loss weights: "
+            + ", ".join(f"{value:.4f}" for value in class_weights.tolist())
+        )
 
     best_metric = float("inf")
     best_state = None
@@ -222,8 +246,12 @@ def fine_tune_bert(
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            loss = (
+                criterion(outputs.logits, labels)
+                if criterion is not None
+                else torch.nn.functional.cross_entropy(outputs.logits, labels)
+            )
             total_loss += loss.item()
             loss.backward()
             optimizer.step()
@@ -241,9 +269,15 @@ def fine_tune_bert(
                     outputs = model(
                         input_ids=batch["input_ids"].to(device),
                         attention_mask=batch["attention_mask"].to(device),
-                        labels=batch["labels"].to(device),
                     )
-                    valid_loss += outputs.loss.item()
+                    valid_labels = batch["labels"].to(device)
+                    valid_loss += (
+                        criterion(outputs.logits, valid_labels)
+                        if criterion is not None
+                        else torch.nn.functional.cross_entropy(
+                            outputs.logits, valid_labels
+                        )
+                    ).item()
             metric = valid_loss / len(valid_loader)
             message += f", valid loss={metric:.6f}"
         print(message)
@@ -259,6 +293,7 @@ def fine_tune_bert(
                     "model_state_dict": best_state,
                     "validation_loss": metric,
                     "model_name_or_path": model_name_or_path,
+                    "class_balanced": balance_classes,
                 },
                 str(checkpoint_path),
             )
@@ -419,6 +454,7 @@ def get_tbert_model(
     cluster_seed=42,
     bert_model="answerdotai/ModernBERT-base",
     bert_fine_tuning=True,
+    balance_bert_classes=True,
 ):
     device = get_device()
     if max_topics_per_word <= 0:
@@ -451,6 +487,7 @@ def get_tbert_model(
         validation_labels=validation_labels,
         model_name_or_path=bert_model,
         fine_tune=bert_fine_tuning,
+        balance_classes=balance_bert_classes,
     )
     model = model.to(device)
     

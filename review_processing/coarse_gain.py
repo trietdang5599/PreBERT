@@ -13,15 +13,17 @@ def get_coarse_sentiment_score(model, tokenizer, text):
     
     logits = outputs.logits
     probabilities = torch.softmax(logits, dim=1)
-    predicted_class = torch.argmax(probabilities, dim=1).item()
-    
-    sentiment_scale = [(0.0, 0.19), (0.2, 0.39), (0.4, 0.59), (0.6, 0.79), (0.8, 0.99)]
-    highest_prob = probabilities[0][predicted_class].item()
-    
-    lower_bound, upper_bound = sentiment_scale[predicted_class]
-    sentiment_score = lower_bound + highest_prob * (upper_bound - lower_bound)
-    
-    return sentiment_score
+    # Preserve uncertainty across all five classes. The former argmax mapping
+    # saturated near 1.0 on imbalanced datasets and discarded useful mass from
+    # minority ratings.
+    rating_values = torch.arange(
+        1,
+        probabilities.shape[1] + 1,
+        device=probabilities.device,
+        dtype=probabilities.dtype,
+    )
+    expected_rating = torch.sum(probabilities[0] * rating_values)
+    return ((expected_rating - 1.0) / max(probabilities.shape[1] - 1, 1)).item()
 
 
 def get_vader_coarse_sentiment_score(text):

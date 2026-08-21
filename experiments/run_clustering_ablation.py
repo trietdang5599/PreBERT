@@ -37,7 +37,7 @@ from train import prepare_deepbert_splits, test, test_rsme, train_deepbert
 
 
 NUM_TOPICS = 40
-FEATURE_PIPELINE_VERSION = 3
+FEATURE_PIPELINE_VERSION = 4
 DEFAULT_BERT_MODEL = "answerdotai/ModernBERT-base"
 LEGACY_BERT_MODEL = "bert-base-uncased"
 BERT_MODEL_ALIASES = {
@@ -125,6 +125,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--balance-bert-classes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use inverse-frequency class weights for BERT fine-tuning.",
+    )
+    parser.add_argument(
         "--cache-root",
         type=Path,
         default=Path("chkpt/clustering_ablation"),
@@ -206,6 +212,7 @@ def encoder_cache_dir(
     feature_mode: str,
     model_id: str,
     fine_tune_bert: bool = True,
+    balance_bert_classes: bool = True,
 ) -> Path:
     path = cache_root / dataset
     if feature_mode != "full":
@@ -217,6 +224,8 @@ def encoder_cache_dir(
         path = path / "encoders" / bert_model_slug(model_id)
     if not fine_tune_bert:
         path = path / "pretrained-only"
+    elif not balance_bert_classes:
+        path = path / "unbalanced-classes"
     return path
 
 
@@ -373,12 +382,14 @@ def result_path(
     feature_mode: str,
     bert_model: str,
     fine_tune_bert: bool,
+    balance_bert_classes: bool,
     seed: int,
 ) -> Path:
     experiment = (
         f"k{NUM_TOPICS}_words{num_words}_tpw{max_topics_per_word}_"
         f"{feature_mode}{encoder_suffix(bert_model)}"
         f"{'_pretrained-only' if not fine_tune_bert else ''}_seed{seed}_"
+        f"{'unbalanced_' if fine_tune_bert and not balance_bert_classes else ''}"
         f"v{FEATURE_PIPELINE_VERSION}"
     )
     return output_dir / dataset / experiment / method_slug / "metrics.json"
@@ -396,6 +407,7 @@ def valid_cached_result(
     feature_mode: str,
     bert_model: str,
     fine_tune_bert: bool,
+    balance_bert_classes: bool,
 ) -> dict[str, Any] | None:
     result = read_json(path)
     expected = {
@@ -410,6 +422,7 @@ def valid_cached_result(
         "seed": seed,
         "groundTruthField": "overall",
         "splitBeforePreprocessing": True,
+        "bertClassBalanced": balance_bert_classes if fine_tune_bert else False,
     }
     expected["bertModel"] = bert_model
     if result is None or any(
@@ -419,7 +432,7 @@ def valid_cached_result(
     # Results created before this option existed were always fine-tuned.
     if result.get("bertFineTuned", True) != fine_tune_bert:
         return None
-    required = ("accuracy", "rmse", "mae")
+    required = ("accuracy", "balancedAccuracy", "macroF1", "rmse", "mae")
     return result if all(key in result for key in required) else None
 
 
@@ -437,6 +450,7 @@ def main() -> None:
     print(f"Feature mode: {args.feature_mode}")
     print(f"BERT encoder: {args.bert_model}")
     print(f"BERT fine-tuning: {args.fine_tune_bert}")
+    print(f"BERT class-balanced loss: {args.balance_bert_classes}")
     print("Clustering methods: " + ", ".join(name for name, _ in methods))
     uses_bert = True
     print("BERT policy: one checkpoint + embeddings + coarse scores per dataset")
@@ -448,6 +462,7 @@ def main() -> None:
                 args.feature_mode,
                 args.bert_model,
                 args.fine_tune_bert,
+                args.balance_bert_classes,
             )
             print(f"  {dataset}: {path} -> {cache_dir}")
         return
@@ -479,6 +494,7 @@ def main() -> None:
             args.feature_mode,
             args.bert_model,
             args.fine_tune_bert,
+            args.balance_bert_classes,
         )
         manifest_path = cache_dir / "manifest.json"
         manifest = read_json(manifest_path)
@@ -487,8 +503,11 @@ def main() -> None:
             and manifest.get("splitFingerprint") == fingerprint
             and manifest.get("featureMode") == args.feature_mode
             and manifest.get("bertModel", LEGACY_BERT_MODEL) == args.bert_model
+            and manifest.get("featurePipelineVersion") == FEATURE_PIPELINE_VERSION
             # Legacy manifests always represent the former fine-tuned mode.
             and manifest.get("bertFineTuned", True) == args.fine_tune_bert
+            and manifest.get("bertClassBalanced", False)
+            == (args.balance_bert_classes if args.fine_tune_bert else False)
             and (
                 not args.fine_tune_bert
                 or (cache_dir / "bert_last_checkpoint.pt").is_file()
@@ -514,6 +533,9 @@ def main() -> None:
             "featureMode": args.feature_mode,
             "bertModel": args.bert_model,
             "bertFineTuned": args.fine_tune_bert,
+            "bertClassBalanced": (
+                args.balance_bert_classes if args.fine_tune_bert else False
+            ),
             "seed": args.seed,
             "trainRows": len(train_df),
             "validRows": len(valid_df),
@@ -535,6 +557,7 @@ def main() -> None:
                 feature_mode=args.feature_mode,
                 bert_model=args.bert_model,
                 fine_tune_bert=args.fine_tune_bert,
+                balance_bert_classes=args.balance_bert_classes,
                 seed=args.seed,
             )
             cached_result = None
@@ -550,6 +573,7 @@ def main() -> None:
                     feature_mode=args.feature_mode,
                     bert_model=args.bert_model,
                     fine_tune_bert=args.fine_tune_bert,
+                    balance_bert_classes=args.balance_bert_classes,
                 )
             if cached_result is None:
                 pending.append((method_name, method_slug, path))
@@ -592,6 +616,7 @@ def main() -> None:
                 cluster_seed=args.seed,
                 bert_model=args.bert_model,
                 bert_fine_tuning=args.fine_tune_bert,
+                balance_bert_classes=args.balance_bert_classes,
             )
             train_loader = csv_to_dataloader(
                 feature_paths["train"], args.batch_size, shuffle=True
@@ -611,7 +636,9 @@ def main() -> None:
                 checkpoint_name,
                 log_interval=100,
             )
-            accuracy = float(test(model, test_loader))
+            classification_metrics = test(
+                model, test_loader, return_details=True
+            )
             rmse, mae = test_rsme(model, test_loader)
             elapsed = time.perf_counter() - started_at
             metrics = {
@@ -628,6 +655,9 @@ def main() -> None:
                 "featureMode": args.feature_mode,
                 "bertModel": args.bert_model,
                 "bertFineTuned": args.fine_tune_bert,
+                "bertClassBalanced": (
+                    args.balance_bert_classes if args.fine_tune_bert else False
+                ),
                 "coarseSentimentMethod": (
                     "fine-tuned-bert" if args.fine_tune_bert else "vader"
                 ),
@@ -638,7 +668,7 @@ def main() -> None:
                 "validRows": len(valid_df),
                 "testRows": len(test_df),
                 "splitFingerprint": fingerprint,
-                "accuracy": accuracy,
+                **classification_metrics,
                 "rmse": float(rmse),
                 "mae": float(mae),
                 "elapsedSeconds": elapsed,
@@ -683,7 +713,8 @@ def main() -> None:
             summaries.append(metrics)
             print(
                 f"Saved {metrics_path} | RMSE={rmse:.6f} | MAE={mae:.6f} | "
-                f"Accuracy={accuracy:.6f}"
+                f"Accuracy={classification_metrics['accuracy']:.6f}, "
+                f"balanced={classification_metrics['balancedAccuracy']:.6f}"
             )
             del model, train_loader, valid_loader, test_loader
             release_device_cache(get_device())

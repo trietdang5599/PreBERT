@@ -30,19 +30,25 @@ DEVICE="mps"                         # mps was used for the thesis; use auto/cud
 TEXT_FIELD="reviewText"
 RATING_FIELD="overall"
 ITEM_FIELD="asin"
+SEGMENTATION_MODE="hybrid"           # hybrid | sentence
+MINIMUM_CLAUSE_WORDS=3
 BATCH_SIZE=16
 REVIEW_BATCH_SIZE=128
 MAX_LENGTH=512
 MAX_SAMPLES=""                       # Empty means all rows.
-REMOVE_MARGIN=0.5
+REMOVE_MARGIN=0.15                   # Deterministic KEEP rules protect rating evidence.
 EMPTY_REVIEW_POLICY="keep-original"
 ADJUST_RATINGS=true
 TRUST_REMOTE_CODE=false
+AUDIT_SAMPLE_SIZE=50
+AUDIT_SEED=42
+AUDIT_OUTPUT_ROOT="experiments/preprocessing_audits"
 
-# Existing processed JSON can be reused because split mapping does not require
-# another LLM pass. Set false + OVERWRITE_PROCESSED=true for a full rebuild.
-REUSE_EXISTING_PROCESSED=true
-OVERWRITE_PROCESSED=false
+# Hybrid segmentation changes the LLM inputs, so rebuild the processed JSON
+# once. After a successful rebuild, these can be changed back to true/false
+# when only regenerating the deterministic split mapping.
+REUSE_EXISTING_PROCESSED=false
+OVERWRITE_PROCESSED=true
 
 RUN_SPLIT=true
 SPLIT_SEED=42
@@ -108,11 +114,16 @@ for index in "${!SOURCES[@]}"; do
         --text-field "${TEXT_FIELD}"
         --rating-field "${RATING_FIELD}"
         --item-field "${ITEM_FIELD}"
+        --segmentation-mode "${SEGMENTATION_MODE}"
+        --minimum-clause-words "${MINIMUM_CLAUSE_WORDS}"
         --batch-size "${BATCH_SIZE}"
         --review-batch-size "${REVIEW_BATCH_SIZE}"
         --max-length "${MAX_LENGTH}"
         --remove-margin "${REMOVE_MARGIN}"
         --empty-review-policy "${EMPTY_REVIEW_POLICY}"
+        --audit-sample-size "${AUDIT_SAMPLE_SIZE}"
+        --audit-seed "${AUDIT_SEED}"
+        --audit-output "${AUDIT_OUTPUT_ROOT}/$(basename "${processed_path}" .json).csv"
       )
       if [[ "${ADJUST_RATINGS}" == true ]]; then
         COMMAND+=(--adjust-ratings)

@@ -81,6 +81,12 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Fine-tune BERT (default) or use its frozen pretrained encoder.",
     )
+    parser.add_argument(
+        "--balance-bert-classes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use inverse-frequency class weights during BERT fine-tuning.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--num-words", type=int, default=100)
@@ -157,6 +163,11 @@ def build_command(
         command.append("--force-bert")
     command.append(
         "--fine-tune-bert" if args.fine_tune_bert else "--no-fine-tune-bert"
+    )
+    command.append(
+        "--balance-bert-classes"
+        if args.balance_bert_classes
+        else "--no-balance-bert-classes"
     )
     if args.force_results:
         command.append("--force-results")

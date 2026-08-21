@@ -225,6 +225,7 @@ def extract_features(
     cluster_seed=42,
     bert_model="answerdotai/ModernBERT-base",
     bert_fine_tuning=True,
+    balance_bert_classes=True,
 ):
     allreviews_path = "feature/allFeatureReview_"
     if os.path.exists(allreviews_path + filename +".csv"):
@@ -243,6 +244,7 @@ def extract_features(
             cluster_seed=cluster_seed,
             bert_model=bert_model,
             bert_fine_tuning=bert_fine_tuning,
+            balance_bert_classes=balance_bert_classes,
         )
         allFeatureReview = extract_review_feature(
             data_df,

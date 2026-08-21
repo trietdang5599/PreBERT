@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import gzip
 import json
 import math
@@ -20,6 +21,7 @@ import tempfile
 import time
 import urllib.request
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 from typing import Any, Iterable, Protocol, Sequence
@@ -42,18 +44,40 @@ except ModuleNotFoundError:
 configure_runtime_environment()
 
 DEFAULT_MODEL = DEFAULT_PREPROCESSING_MODEL
-SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])(?:\s+|(?=[A-Z]))|[\r\n]+")
+CLAUSE_BOUNDARY = re.compile(
+    r"(?<=[;:])\s+|(?<=[—–])\s*|(?<=,)\s+(?=(?:but|however|yet|while|whereas)\b)",
+    re.IGNORECASE,
+)
+ABBREVIATIONS = {
+    "dr.", "e.g.", "etc.", "i.e.", "jr.", "mr.", "mrs.", "ms.",
+    "no.", "prof.", "sr.", "st.", "u.k.", "u.s.", "vs.",
+}
 
 RELEVANCE_INSTRUCTION = """Decide whether the Amazon review segment should be kept for rating prediction.
 
-KEEP direct or indirect evidence about sentiment, opinion, preference, engagement, repeated use, product quality, performance, usability, benefits, problems, value, comparisons, or recommendations. A segment can be evaluative without using an emotion word. For example, descriptions of how often someone uses a product or what benefit it provides are evaluative evidence.
+KEEP every segment that helps explain the rating: sentiment, preference,
+recommended age or audience, engagement, repeated use, quality, performance,
+usability, benefits, defects, value, comparisons, or recommendations. Concrete
+evidence such as poor drilling, a broken part, loving a genre, or suitability
+for a wedding is evaluative even without a rating word.
 
-REMOVE only segments that are purely metadata, logistics, identifiers, or background facts and contain no evidence about the product experience. When uncertain, choose KEEP so that important meaning is not lost.
+REMOVE only content that cannot help predict the product rating: raw copied
+ingredient/track/variant/specification lists; free-product or sponsored-review
+disclosures; seller/shipping/packaging/availability-only details; signatures
+and identifiers. Ingredient effects and other reviewer interpretations are
+evaluation and must be kept.
+
+Judge the TARGET itself. Context only resolves references and must not turn
+metadata into rating evidence. Never remove a target containing any product
+opinion or experience. When uncertain, choose KEEP.
 
 Domain-specific examples:
 {few_shots}
 
-Segment:
+Full sentence context:
+{context}
+
+Target segment:
 {text}
 
 Return exactly one label: KEEP or REMOVE.
@@ -75,12 +99,21 @@ DOMAIN_RELEVANCE_EXAMPLES = {
     "all_beauty": (
         ("It smells wonderful and leaves my skin soft for hours.", "KEEP"),
         ("The applicator is awkward and wastes a lot of product.", "KEEP"),
+        ("Salicylic acid helped clear my existing breakouts.", "KEEP"),
+        (
+            "Ingredients: Water, Glycerin, Cetearyl Alcohol, Fragrance, Phenoxyethanol.",
+            "REMOVE",
+        ),
+        ("I received this product free in exchange for an honest review.", "REMOVE"),
         ("The bottle contains 8 fluid ounces.", "REMOVE"),
         ("I ordered it on May 3 and it arrived in a cardboard box.", "REMOVE"),
     ),
     "digital_music": (
         ("The vocals are powerful, but the production sounds muddy.", "KEEP"),
         ("I keep replaying this album because every track is memorable.", "KEEP"),
+        ("I love the 80's.", "KEEP"),
+        ("This beautiful song is perfect for a wedding first dance.", "KEEP"),
+        ("Track list: Intro, First Light, Home Again, Finale.", "REMOVE"),
         ("The album contains twelve tracks and was released in 2012.", "REMOVE"),
         ("The MP3 file is four minutes long.", "REMOVE"),
     ),
@@ -90,16 +123,74 @@ DOMAIN_RELEVANCE_EXAMPLES = {
             "It does a nice job in helping to develop both motor skills and mental acuity.",
             "KEEP",
         ),
+        ("The holes were poorly drilled and the plywood splintered.", "KEEP"),
+        (
+            "This is too difficult for a five-year-old but works for ages seven and up.",
+            "KEEP",
+        ),
+        ("Included items: red card, blue card, six tokens, instruction sheet.", "REMOVE"),
+        ("I received this toy free from the manufacturer for review.", "REMOVE"),
         ("This was purchased for a 2 3/4 year old boy.", "REMOVE"),
         ("The box has a blue product code printed on the side.", "REMOVE"),
     ),
     "general": (
         ("I use it every day and it works exactly as expected.", "KEEP"),
         ("It broke after two uses and was a waste of money.", "KEEP"),
+        ("I received a free sample in exchange for my honest opinion.", "REMOVE"),
         ("The package arrived on Tuesday.", "REMOVE"),
         ("The item number is printed below the barcode.", "REMOVE"),
     ),
 }
+
+DISCLOSURE_PATTERNS = (
+    re.compile(
+        r"\b(?:I|we)\s+(?:received|got|was given|were given|was sent|were sent)\b"
+        r".{0,100}\b(?:in exchange for|for (?:an? )?(?:honest )?review|"
+        r"review purposes?|free (?:sample|product|item|toy|copy)|"
+        r"complimentary (?:sample|product|item|toy|copy))\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:this|the)\s+(?:product|item|toy|album|copy)\s+was\s+"
+        r"(?:provided|supplied|sent)\b.{0,60}\b(?:for review|free of charge)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:I|we)\b.{0,60}\b(?:bzzagent|momselect|vine voice|review program)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:I was not compensated|opinions? (?:are|remain) my own)\b",
+        re.IGNORECASE,
+    ),
+)
+RAW_LIST_HEADING = re.compile(
+    r"\b(?:active\s+|inactive\s+)?ingredients?\b\s*(?:list\s*:|:)|"
+    r"\b(?:track|product|variant|scent|specification|package contents?|included items?)"
+    r"\s+list\b\s*:|\bhere (?:are|is)\b.{0,15}\bingredients?\b.{0,100}:\s*$",
+    re.IGNORECASE,
+)
+PRODUCT_LIST_INTRO = re.compile(
+    r"\b(?:list (?:to help|of)|available (?:colors|scents|variants)|"
+    r"choose (?:your|a) favorite|included items?|package contents?|track list)\b",
+    re.IGNORECASE,
+)
+INGREDIENT_VOCABULARY = re.compile(
+    r"\b(?:water|aqua|acid|alcohol|glycerin|glyceryl|sodium|potassium|extract|"
+    r"oil|fragrance|parfum|silica|stearate|sulfate|chloride|tocopher\w*|"
+    r"phenoxyethanol|dimethicone|cellulose|sorbitol|colorant|ci\s*\d+)\b",
+    re.IGNORECASE,
+)
+EVALUATIVE_SIGNAL = re.compile(
+    r"\b(?:love|like|hate|dislike|favorite|best|worst|great|good|bad|beautiful|"
+    r"excellent|amazing|awesome|perfect|poor|poorly|cheap|expensive|overpriced|"
+    r"disappoint\w*|ashamed|recommend\w*|worth|waste|works?|worked|working|"
+    r"broke|broken|durable|sturdy|easy|difficult|hard|soft|smooth|irritat\w*|"
+    r"comfortable|uncomfortable|useful|useless|fun|boring|enjoy\w*|suitable|"
+    r"appropriate|too young|too old|helped?|effective|quality|problem|defect|"
+    r"flaw|smells?|sounds?|tastes?|plays?|replay\w*|purchase again|buy again)\b",
+    re.IGNORECASE,
+)
 
 DOMAIN_ALIASES = {
     "ab": "all_beauty",
@@ -111,8 +202,16 @@ DOMAIN_ALIASES = {
 }
 
 
+@dataclass(frozen=True)
+class ReviewSegment:
+    text: str
+    context: str
+    forced_relevance: bool | None = None
+    decision_reason: str | None = None
+
+
 class ReviewClassifier(Protocol):
-    def classify_relevance(self, texts: Sequence[str]) -> list[bool]: ...
+    def classify_relevance(self, segments: Sequence[ReviewSegment]) -> list[bool]: ...
 
     def classify_polarity(self, texts: Sequence[str]) -> list[int]: ...
 
@@ -136,18 +235,45 @@ def parse_preprocess_args(argv: Sequence[str] | None = None) -> argparse.Namespa
     parser.add_argument("--text-field", default="reviewText")
     parser.add_argument("--rating-field", default="overall")
     parser.add_argument("--item-field", default="asin")
+    parser.add_argument(
+        "--segmentation-mode",
+        choices=("sentence", "hybrid"),
+        default="hybrid",
+        help=(
+            "sentence=terminal punctuation/newlines only; hybrid additionally "
+            "splits strong punctuation and selected contrastive conjunctions"
+        ),
+    )
+    parser.add_argument(
+        "--minimum-clause-words",
+        type=int,
+        default=3,
+        help="Merge shorter clause fragments with a neighbour (default: 3)",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--review-batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument(
         "--remove-margin",
         type=float,
-        default=0.5,
+        default=0.15,
         help=(
             "Require the REMOVE logit to exceed KEEP by this margin; larger "
-            "values preserve more uncertain segments (default: 0.5)"
+            "values preserve more uncertain segments (default: 0.15)"
         ),
     )
+    parser.add_argument(
+        "--audit-sample-size",
+        type=int,
+        default=50,
+        help="Random reviews added to the preprocessing audit (default: 50)",
+    )
+    parser.add_argument(
+        "--audit-output",
+        type=Path,
+        help="Audit CSV path (default: <output>_preprocessing_audit.csv)",
+    )
+    parser.add_argument("--audit-seed", type=int, default=42)
     parser.add_argument(
         "--device",
         choices=("auto", "mps", "cuda", "cpu"),
@@ -185,6 +311,10 @@ def parse_preprocess_args(argv: Sequence[str] | None = None) -> argparse.Namespa
         parser.error("--max-length must be at least 32")
     if args.remove_margin < 0:
         parser.error("--remove-margin must be non-negative")
+    if args.minimum_clause_words < 1:
+        parser.error("--minimum-clause-words must be positive")
+    if args.audit_sample_size < 0:
+        parser.error("--audit-sample-size must be non-negative")
     if args.max_samples is not None and args.max_samples <= 0:
         parser.error("--max-samples must be greater than zero")
     if args.input.resolve() == args.output.resolve():
@@ -240,11 +370,195 @@ def read_jsonl(path: Path, max_samples: int | None = None) -> list[dict[str, Any
     return rows
 
 
-def split_review(text: Any) -> list[str]:
+def is_disclosure(text: str) -> bool:
+    return any(pattern.search(text) for pattern in DISCLOSURE_PATTERNS)
+
+
+def is_raw_ingredient_list(text: str) -> bool:
+    comma_parts = [part.strip() for part in text.split(",") if part.strip()]
+    if len(comma_parts) < 5:
+        return False
+    short_part_rate = sum(
+        len(part.split()) <= 8 for part in comma_parts
+    ) / len(comma_parts)
+    return (
+        len(INGREDIENT_VOCABULARY.findall(text)) >= 3
+        and short_part_rate >= 0.70
+    )
+
+
+def is_catalog_entry(text: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"\*?[A-Z][A-Za-z'& /-]{2,28}(?:\s+\([^)]{2,35}\))?\s+"
+            r"[A-Z][^.!?]{2,100}[.!?]?",
+            text.strip(),
+        )
+    ) and not bool(re.search(r"\b(?:I|we|my|our)\b", text, re.IGNORECASE))
+
+
+def prohibited_content_labels(text: Any) -> list[str]:
+    """Detect content that must never survive preprocessing."""
     if not isinstance(text, str) or not text.strip():
         return []
+    labels: list[str] = []
+    units = [
+        unit.strip()
+        for unit in re.split(r"(?<=[.!?])\s+|[\r\n]+", text)
+        if unit.strip()
+    ]
+    if any(is_disclosure(unit) for unit in units):
+        labels.append("disclosure")
+    if any(is_raw_ingredient_list(unit) for unit in units):
+        labels.append("raw_ingredient_list")
+    catalog_count = sum(is_catalog_entry(unit) for unit in units)
+    if PRODUCT_LIST_INTRO.search(text) and catalog_count >= 8:
+        labels.append("raw_product_list")
+    return labels
+
+
+def annotate_segments(segments: Sequence[ReviewSegment]) -> list[ReviewSegment]:
+    """Apply conservative, deterministic decisions around the LLM classifier."""
+    catalog_indices = {
+        index for index, segment in enumerate(segments) if is_catalog_entry(segment.text)
+    }
+    copied_catalog = len(catalog_indices) >= 8 and any(
+        PRODUCT_LIST_INTRO.search(segment.text) for segment in segments
+    )
+    annotated: list[ReviewSegment] = []
+    for index, segment in enumerate(segments):
+        text = segment.text
+        if is_disclosure(text):
+            decision, reason = False, "disclosure"
+        elif is_raw_ingredient_list(text):
+            decision, reason = False, "raw_ingredient_list"
+        elif RAW_LIST_HEADING.search(text):
+            decision, reason = False, "raw_list_heading"
+        elif copied_catalog and (
+            index in catalog_indices or PRODUCT_LIST_INTRO.search(text)
+        ):
+            decision, reason = False, "raw_product_list"
+        elif EVALUATIVE_SIGNAL.search(text):
+            decision, reason = True, "evaluative_signal"
+        else:
+            decision, reason = None, None
+        annotated.append(
+            ReviewSegment(
+                text=text,
+                context=segment.context,
+                forced_relevance=decision,
+                decision_reason=reason,
+            )
+        )
+    return annotated
+
+
+def _is_abbreviation(sentence_prefix: str) -> bool:
+    match = re.search(r"([A-Za-z][A-Za-z.]*)$", sentence_prefix)
+    if match is None:
+        return False
+    token = match.group(1).lower()
+    return token in ABBREVIATIONS or bool(
+        re.fullmatch(r"(?:[a-z]\.){2,}", token)
+    )
+
+
+def _sentence_chunks(paragraph: str) -> list[str]:
+    """Split terminal punctuation without breaking decimals or abbreviations."""
+    chunks: list[str] = []
+    start = 0
+    for match in re.finditer(r"[.!?]+(?:[\"')\]]*)?(?=\s+|$)", paragraph):
+        punctuation = match.group(0)
+        if punctuation.startswith(".") and _is_abbreviation(
+            paragraph[start : match.start() + 1]
+        ):
+            following = paragraph[match.end() :].lstrip()
+            next_word = re.match(r"[\"'(\[]*([A-Za-z]+)", following)
+            sentence_starters = {
+                "a", "he", "i", "it", "she", "that", "the", "they",
+                "this", "we",
+            }
+            if next_word is None or next_word.group(1).lower() not in sentence_starters:
+                continue
+        end = match.end()
+        chunk = paragraph[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        whitespace = re.match(r"\s+", paragraph[end:])
+        start = end + (whitespace.end() if whitespace else 0)
+    remainder = paragraph[start:].strip()
+    if remainder:
+        chunks.append(remainder)
+    return chunks
+
+
+def _merge_short_clauses(parts: Sequence[str], minimum_words: int) -> list[str]:
+    merged: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if merged and len(part.split()) < minimum_words:
+            merged[-1] = f"{merged[-1]} {part}"
+        else:
+            merged.append(part)
+    if (
+        len(merged) > 1
+        and len(merged[0].split()) < minimum_words
+        and not merged[0].endswith(":")
+    ):
+        merged[1] = f"{merged[0]} {merged[1]}"
+        merged.pop(0)
+    return merged
+
+
+def segment_review(
+    text: Any,
+    *,
+    mode: str = "hybrid",
+    minimum_clause_words: int = 3,
+) -> list[ReviewSegment]:
+    if not isinstance(text, str) or not text.strip():
+        return []
+    if mode not in {"sentence", "hybrid"}:
+        raise ValueError("segmentation mode must be 'sentence' or 'hybrid'")
     normalized = re.sub(r"[ \t]+", " ", text.replace("\\/", "/")).strip()
-    return [segment.strip() for segment in SENTENCE_BOUNDARY.split(normalized) if segment.strip()]
+    sentences = [
+        sentence
+        for paragraph in re.split(r"[\r\n]+", normalized)
+        if paragraph.strip()
+        for sentence in _sentence_chunks(paragraph.strip())
+    ]
+    segments: list[ReviewSegment] = []
+    for sentence in sentences:
+        parts = (
+            _merge_short_clauses(
+                CLAUSE_BOUNDARY.split(sentence), minimum_clause_words
+            )
+            if mode == "hybrid"
+            else [sentence]
+        )
+        segments.extend(
+            ReviewSegment(text=part, context=sentence) for part in parts
+        )
+    return annotate_segments(segments)
+
+
+def split_review(
+    text: Any,
+    *,
+    mode: str = "hybrid",
+    minimum_clause_words: int = 3,
+) -> list[str]:
+    """Compatibility wrapper returning only segment text."""
+    return [
+        segment.text
+        for segment in segment_review(
+            text,
+            mode=mode,
+            minimum_clause_words=minimum_clause_words,
+        )
+    ]
 
 
 def batched(values: Sequence[Any], size: int) -> Iterable[Sequence[Any]]:
@@ -292,12 +606,32 @@ def preprocess_batch(
     item_field: str,
     empty_review_policy: str,
     adjust_ratings: bool,
+    segmentation_mode: str = "hybrid",
+    minimum_clause_words: int = 3,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
-    split_rows = [split_review(row.get(text_field)) for row in rows]
+    split_rows = [
+        segment_review(
+            row.get(text_field),
+            mode=segmentation_mode,
+            minimum_clause_words=minimum_clause_words,
+        )
+        for row in rows
+    ]
     segments = [segment for parts in split_rows for segment in parts]
-    decisions = classifier.classify_relevance(segments) if segments else []
-    if len(decisions) != len(segments):
+    unresolved = [
+        segment for segment in segments if segment.forced_relevance is None
+    ]
+    model_decisions = classifier.classify_relevance(unresolved) if unresolved else []
+    if len(model_decisions) != len(unresolved):
         raise RuntimeError("Relevance classifier returned an unexpected result count")
+    decisions: list[bool] = []
+    model_cursor = 0
+    for segment in segments:
+        if segment.forced_relevance is None:
+            decisions.append(model_decisions[model_cursor])
+            model_cursor += 1
+        else:
+            decisions.append(segment.forced_relevance)
 
     cursor = 0
     filtered_texts: list[str] = []
@@ -305,11 +639,43 @@ def preprocess_batch(
     for parts in split_rows:
         part_decisions = decisions[cursor : cursor + len(parts)]
         cursor += len(parts)
-        kept = [part for part, keep in zip(parts, part_decisions) if keep]
+        kept: list[str] = []
+        for index, (part, keep) in enumerate(zip(parts, part_decisions)):
+            if not keep:
+                continue
+            text = part.text
+            if index > 0 and not part_decisions[index - 1]:
+                text = re.sub(
+                    r"^(?:but|however|yet|while|whereas)\b\s*[,;:]?\s*",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            if text:
+                kept.append(text)
         removed_counts.append(len(parts) - len(kept))
         if not kept and parts and empty_review_policy == "keep-original":
-            kept = parts
+            # Restore only non-prohibited segments if the LLM removed every
+            # useful candidate. Raw lists/disclosures must never be restored.
+            kept = [
+                part.text
+                for part in parts
+                if part.forced_relevance is not False
+                and not prohibited_content_labels(part.text)
+            ]
         filtered_texts.append(" ".join(kept))
+
+    violations = [
+        (index, prohibited_content_labels(text))
+        for index, text in enumerate(filtered_texts)
+        if prohibited_content_labels(text)
+    ]
+    if violations:
+        preview = ", ".join(
+            f"batch row {index}: {'/'.join(labels)}"
+            for index, labels in violations[:5]
+        )
+        raise RuntimeError(f"Prohibited content survived preprocessing: {preview}")
 
     polarities = (
         classifier.classify_polarity(filtered_texts) if adjust_ratings else [1] * len(rows)
@@ -319,6 +685,13 @@ def preprocess_batch(
 
     output: list[dict[str, Any]] = []
     stats: Counter[str] = Counter()
+    stats["segments_forced_keep"] += sum(
+        segment.forced_relevance is True for segment in segments
+    )
+    stats["segments_forced_remove"] += sum(
+        segment.forced_relevance is False for segment in segments
+    )
+    stats["segments_llm_classified"] += len(unresolved)
     for row, filtered_text, removed, polarity in zip(
         rows, filtered_texts, removed_counts, polarities
     ):
@@ -520,13 +893,14 @@ class LlamaReviewClassifier:
             raise RuntimeError("Classifier failed to produce all requested labels")
         return [str(result) for result in results]
 
-    def classify_relevance(self, texts: Sequence[str]) -> list[bool]:
+    def classify_relevance(self, segments: Sequence[ReviewSegment]) -> list[bool]:
         prompts = [
             RELEVANCE_INSTRUCTION.format(
-                text=text,
+                text=segment.text,
+                context=segment.context,
                 few_shots=self.relevance_examples,
             )
-            for text in texts
+            for segment in segments
         ]
         labels = self._classify(
             prompts,
@@ -563,11 +937,114 @@ def write_jsonl_atomic(path: Path, rows: Iterable[dict[str, Any]]) -> None:
         raise
 
 
+def write_preprocessing_audit(
+    path: Path,
+    rows: Sequence[dict[str, Any]],
+    *,
+    source_field: str,
+    processed_field: str = "filteredReviewText",
+    random_sample_size: int = 50,
+    seed: int = 42,
+) -> dict[str, int]:
+    """Write all heavily shortened reviews plus a reproducible random sample."""
+    heavy_indices: set[int] = set()
+    for index, row in enumerate(rows):
+        original_words = len(str(row.get(source_field) or "").split())
+        processed_words = len(str(row.get(processed_field) or "").split())
+        removed_ratio = (
+            1.0 - processed_words / original_words if original_words else 0.0
+        )
+        if removed_ratio >= 0.25:
+            heavy_indices.add(index)
+    rng = np.random.default_rng(seed)
+    sample_count = min(random_sample_size, len(rows))
+    random_indices = set(
+        int(value)
+        for value in rng.choice(len(rows), size=sample_count, replace=False)
+    )
+    selected = sorted(heavy_indices | random_indices)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    fields = (
+        "source_row_index",
+        "reviewerID",
+        "asin",
+        "overall",
+        "audit_reason",
+        "removed_word_ratio",
+        "reviewText",
+        "filteredReviewText",
+        "audit_decision",
+        "audit_notes",
+    )
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            for index in selected:
+                row = rows[index]
+                original = str(row.get(source_field) or "")
+                processed = str(row.get(processed_field) or "")
+                original_words = len(original.split())
+                processed_words = len(processed.split())
+                reasons = []
+                if index in heavy_indices:
+                    reasons.append("removed_at_least_25_percent")
+                if index in random_indices:
+                    reasons.append("random_overkeeping_audit")
+                writer.writerow(
+                    {
+                        "source_row_index": index,
+                        "reviewerID": row.get("reviewerID"),
+                        "asin": row.get("asin"),
+                        "overall": row.get("overall"),
+                        "audit_reason": ";".join(reasons),
+                        "removed_word_ratio": (
+                            1.0 - processed_words / original_words
+                            if original_words
+                            else 0.0
+                        ),
+                        "reviewText": original,
+                        "filteredReviewText": processed,
+                        "audit_decision": "",
+                        "audit_notes": "",
+                    }
+                )
+        temporary_path.replace(path)
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+    return {
+        "heavy_removal_reviews": len(heavy_indices),
+        "random_reviews": len(random_indices),
+        "audit_rows": len(selected),
+    }
+
+
 def preprocess_main(argv: Sequence[str] | None = None) -> None:
     args = parse_preprocess_args(argv)
     rows = read_jsonl(args.input, args.max_samples)
     domain = infer_domain(args.input, args.domain)
-    segment_counts = [len(split_review(row.get(args.text_field))) for row in rows]
+    segment_counts = [
+        len(
+            split_review(
+                row.get(args.text_field),
+                mode=args.segmentation_mode,
+                minimum_clause_words=args.minimum_clause_words,
+            )
+        )
+        for row in rows
+    ]
     missing_text = sum(count == 0 for count in segment_counts)
     classification_count = sum(segment_counts) + (len(rows) if args.adjust_ratings else 0)
     print("LLM review preprocessing")
@@ -576,6 +1053,9 @@ def preprocess_main(argv: Sequence[str] | None = None) -> None:
     print(f"  model: {args.model}")
     print(f"  few-shot domain: {domain}")
     print(f"  REMOVE decision margin: {args.remove_margin}")
+    print(f"  segmentation mode: {args.segmentation_mode}")
+    print(f"  minimum clause words: {args.minimum_clause_words}")
+    print(f"  preprocessing audit random sample: {args.audit_sample_size}")
     print(f"  rows: {len(rows)}")
     print(f"  rows without text: {missing_text}")
     print(f"  review segments: {sum(segment_counts)}")
@@ -610,6 +1090,8 @@ def preprocess_main(argv: Sequence[str] | None = None) -> None:
             item_field=args.item_field,
             empty_review_policy=args.empty_review_policy,
             adjust_ratings=args.adjust_ratings,
+            segmentation_mode=args.segmentation_mode,
+            minimum_clause_words=args.minimum_clause_words,
         )
         processed.extend(output_batch)
         totals.update(stats)
@@ -624,9 +1106,20 @@ def preprocess_main(argv: Sequence[str] | None = None) -> None:
         )
 
     write_jsonl_atomic(args.output, processed)
+    audit_path = args.audit_output or args.output.with_name(
+        f"{args.output.stem}_preprocessing_audit.csv"
+    )
+    audit_stats = write_preprocessing_audit(
+        audit_path,
+        processed,
+        source_field=args.text_field,
+        random_sample_size=args.audit_sample_size,
+        seed=args.audit_seed,
+    )
     print("\nResults")
     print(json.dumps(dict(totals), indent=2))
     print(f"Saved: {args.output}")
+    print(f"Audit: {audit_path} ({json.dumps(audit_stats)})")
 
 
 DEFAULT_SOURCE_URL = (

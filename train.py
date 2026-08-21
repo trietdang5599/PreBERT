@@ -8,7 +8,13 @@ import pandas as pd
 import tqdm
 from helper.general_functions import create_and_write_csv, word_segment
 from combine_review_rating import Calculate_Deep
-from sklearn.metrics import accuracy_score, mean_absolute_error
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+)
 from review_processing.merge_senmatic_review import (
     extract_features,
     merge_fine_coarse_features,
@@ -199,7 +205,7 @@ def evaluate_regression(model, data_loader):
             predictions.extend(output.cpu().tolist())
     return calculate_rmse(targets, predictions), mean_absolute_error(targets, predictions)
 
-def test(model, data_loader):
+def test(model, data_loader, return_details=False):
     model.eval()
     device = next(model.parameters()).device
     targets, predicts = list(), list()
@@ -233,8 +239,25 @@ def test(model, data_loader):
     new_predicts = [-1 if i < 4 else 1 for i in predicts]
 
     accuracy = accuracy_score(new_targets, new_predicts)
-    print("Accuracy: ", accuracy)
-    return accuracy
+    details = {
+        "accuracy": float(accuracy),
+        "balancedAccuracy": float(
+            balanced_accuracy_score(new_targets, new_predicts)
+        ),
+        "macroF1": float(
+            f1_score(new_targets, new_predicts, average="macro", zero_division=0)
+        ),
+        "confusionMatrix": confusion_matrix(
+            new_targets, new_predicts, labels=[-1, 1]
+        ).tolist(),
+    }
+    print(
+        "Classification metrics: "
+        f"accuracy={details['accuracy']:.6f}, "
+        f"balanced accuracy={details['balancedAccuracy']:.6f}, "
+        f"macro-F1={details['macroF1']:.6f}"
+    )
+    return details if return_details else accuracy
 
 def test_rsme(model, data_loader):
     model.eval()
@@ -445,6 +468,7 @@ def prepare_deepbert_splits(
     cluster_seed=42,
     bert_model="answerdotai/ModernBERT-base",
     bert_fine_tuning=True,
+    balance_bert_classes=True,
 ):
     """Fit on fixed train/validation splits and evaluate original test ratings."""
     if feature_mode not in {"full", "review-only", "rating-only", "raw"}:
@@ -495,6 +519,7 @@ def prepare_deepbert_splits(
         cluster_seed=cluster_seed,
         bert_model=bert_model,
         bert_fine_tuning=bert_fine_tuning,
+        balance_bert_classes=balance_bert_classes,
     )
     feature_diagnostics = _fine_feature_diagnostics(
         train_review_rows,

@@ -11,10 +11,11 @@ DATASETS=(
   Small_Toys_and_Games_5_llama_filtered
 )
 SEEDS=(42)
-FEATURE_MODES=(full)                 # Used when MODE=custom.
+FEATURE_MODES=(full review-only rating-only raw)                 # Used when MODE='full', 'review-only', 'rating-only', 'raw'.
 CLUSTER_METHODS=(birch)              # Used when MODE=custom.
 BERT_MODELS=(modernbert-base)        # ModernBERT is the project default; used when MODE=custom.
-FINE_TUNE_BERT=false                  # false = frozen pretrained BERT embeddings + VADER coarse score.
+FINE_TUNE_BERT=true                  # false = frozen pretrained BERT embeddings + VADER coarse score.
+BALANCE_BERT_CLASSES=true             # Inverse-frequency loss when fine-tuning.
 BATCH_SIZE=32
 EPOCHS=100
 NUM_WORDS=100
@@ -66,6 +67,11 @@ for mode in "${MODES[@]}"; do
     COMMAND+=(--fine-tune-bert)
   else
     COMMAND+=(--no-fine-tune-bert)
+  fi
+  if [[ "${BALANCE_BERT_CLASSES}" == true ]]; then
+    COMMAND+=(--balance-bert-classes)
+  else
+    COMMAND+=(--no-balance-bert-classes)
   fi
   [[ "${FORCE_RESULTS}" == true ]] && COMMAND+=(--force-results)
   [[ "${KEEP_GOING}" == true ]] && COMMAND+=(--keep-going)

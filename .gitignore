@@ -11,6 +11,8 @@ experiments/tests/
 experiments/eval_outputs/
 experiments/semantic_outputs/
 experiments/backup_outputs/
+experiments/backup_outputs/
+experiments/preprocessing_audits/
 __pycache__/
 config/.DS_Store
 .DS_Store

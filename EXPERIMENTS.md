@@ -27,10 +27,24 @@ The dispatcher runs:
 4. `run_semantic_retention.sh`: semantic-retention evaluation for all three
    processed datasets.
 
-Existing `*_llama_filtered.json` files are reused by default, so splitting can
-be regenerated without another expensive LLM preprocessing pass. In
-`run_preprocessing.sh`, set `REUSE_EXISTING_PROCESSED=false` and
-`OVERWRITE_PROCESSED=true` to reproduce preprocessing from scratch.
+Existing `*_llama_filtered.json` files can be reused when only regenerating
+split mappings. The launcher is temporarily configured to rebuild them once
+so the new hybrid segmentation is actually applied; afterwards set
+`REUSE_EXISTING_PROCESSED=true` and `OVERWRITE_PROCESSED=false` to skip the
+expensive LLM pass.
+The preprocessing launcher defaults to hybrid segmentation: robust sentence
+boundaries plus `;`, `:`, em dashes, and comma-prefixed contrastive connectors
+such as `but`, `however`, and `whereas`. Set `SEGMENTATION_MODE=sentence` for
+the sentence-only ablation.
+
+Preprocessing uses deterministic safety rules around the LLM decision: explicit
+rating evidence (including age suitability, music preference, and concrete
+product defects) is protected, while raw ingredient/catalog lists and review
+disclosures are removed and checked again before the output is written. Each
+run also writes an audit CSV under `experiments/preprocessing_audits/` containing
+every review shortened by at least 25% plus 50 deterministic random reviews.
+Complete `audit_decision` and `audit_notes` manually, then use the unchanged
+semantic-retention evaluator to inspect every similarity below `0.80`.
 
 Each stage can also be run independently:
 
@@ -46,6 +60,11 @@ To use BERT only as a frozen pretrained encoder, set
 random classification head: it uses pretrained BERT embeddings for clustering
 and VADER for the coarse sentiment score. Its caches and result paths are
 isolated with a `pretrained-only` suffix.
+
+Fine-tuned runs use inverse-frequency class weights by default to prevent the
+majority five-star class from dominating. Set `BALANCE_BERT_CLASSES=false` in
+`scripts/run_prebert.sh` for an unweighted comparison. Schema-v4 metrics also
+include balanced accuracy, macro-F1, and a binary confusion matrix.
 
 ## PreBERT
 
