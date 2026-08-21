@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Unified command-line entry point for PreBERT experiments.
 
-The heavy work remains in ``run_clustering_ablation.py``. This file defines
-reproducible presets so main results and ablations use exactly the same split,
-cache, feature extraction, training, and metrics implementation.
+The heavy work remains in ``experiments/run_clustering_ablation.py``. This file
+defines reproducible presets so main results and ablations use exactly the same
+split, cache, feature extraction, training, and metrics implementation.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ DEFAULT_DATASETS = (
 )
 FEATURE_MODES = ("full", "review-only", "rating-only", "raw")
 CLUSTER_METHODS = ("kmeans", "birch", "bisectingkmeans", "dbscan")
-BERT_MODELS = ("bert-base", "modernbert-base", "mmbert-base")
-REPO_ROOT = Path(__file__).resolve().parent
+BERT_MODELS = ("modernbert-base", "bert-base", "mmbert-base")
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 @dataclass(frozen=True)
@@ -39,14 +39,14 @@ class ExperimentPreset:
 
 
 PRESETS = {
-    "main": ExperimentPreset(("full",), ("birch",), ("bert-base",)),
+    "main": ExperimentPreset(("full",), ("birch",), ("modernbert-base",)),
     "preprocessing-ablation": ExperimentPreset(
         ("raw", "review-only", "rating-only", "full"),
         ("birch",),
-        ("bert-base",),
+        ("modernbert-base",),
     ),
     "clustering-ablation": ExperimentPreset(
-        ("full",), CLUSTER_METHODS, ("bert-base",)
+        ("full",), CLUSTER_METHODS, ("modernbert-base",)
     ),
     "encoder-ablation": ExperimentPreset(("full",), ("birch",), BERT_MODELS),
 }
@@ -74,7 +74,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cluster-methods", nargs="+", choices=CLUSTER_METHODS, default=["birch"]
     )
-    parser.add_argument("--bert-models", nargs="+", default=["bert-base"])
+    parser.add_argument("--bert-models", nargs="+", default=["modernbert-base"])
+    parser.add_argument(
+        "--fine-tune-bert",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fine-tune BERT (default) or use its frozen pretrained encoder.",
+    )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--num-words", type=int, default=100)
@@ -122,7 +128,8 @@ def build_command(
 ) -> list[str]:
     command = [
         sys.executable,
-        str(REPO_ROOT / "run_clustering_ablation.py"),
+        "-m",
+        "experiments.run_clustering_ablation",
         "--datasets",
         *args.datasets,
         "--feature-mode",
@@ -148,6 +155,9 @@ def build_command(
     ]
     if args.force_bert:
         command.append("--force-bert")
+    command.append(
+        "--fine-tune-bert" if args.fine_tune_bert else "--no-fine-tune-bert"
+    )
     if args.force_results:
         command.append("--force-results")
     if args.dry_run:

@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 try:
-    from exp_llm.llm_settings import (
+    from helper.llm_settings import (
         DEFAULT_SEMANTIC_MODEL,
         configure_runtime_environment,
     )
-except ModuleNotFoundError:  # Direct execution from inside exp_llm/.
-    from llm_settings import (
+except ModuleNotFoundError:  # Direct execution from inside experiments/.
+    from helper.llm_settings import (
         DEFAULT_SEMANTIC_MODEL,
         configure_runtime_environment,
     )

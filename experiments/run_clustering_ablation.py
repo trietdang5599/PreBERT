@@ -13,10 +13,15 @@ import hashlib
 import json
 import os
 import random
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Let unsupported Metal operations fall back to CPU instead of aborting.
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
@@ -32,12 +37,13 @@ from train import prepare_deepbert_splits, test, test_rsme, train_deepbert
 
 
 NUM_TOPICS = 40
-FEATURE_PIPELINE_VERSION = 2
-DEFAULT_BERT_MODEL = "bert-base-uncased"
+FEATURE_PIPELINE_VERSION = 3
+DEFAULT_BERT_MODEL = "answerdotai/ModernBERT-base"
+LEGACY_BERT_MODEL = "bert-base-uncased"
 BERT_MODEL_ALIASES = {
-    "bert-base": DEFAULT_BERT_MODEL,
-    "bert-base-uncased": DEFAULT_BERT_MODEL,
-    "modernbert-base": "answerdotai/ModernBERT-base",
+    "bert-base": LEGACY_BERT_MODEL,
+    "bert-base-uncased": LEGACY_BERT_MODEL,
+    "modernbert-base": DEFAULT_BERT_MODEL,
     "mmbert-base": "jhu-clsp/mmBERT-base",
 }
 DEFAULT_DATASETS = [
@@ -106,6 +112,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Encoder alias or Hugging Face model ID. Aliases: bert-base, "
             "modernbert-base, mmbert-base."
+        ),
+    )
+    parser.add_argument(
+        "--fine-tune-bert",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Fine-tune BERT for sentiment (default). With "
+            "--no-fine-tune-bert, use a frozen pretrained encoder and VADER "
+            "for coarse sentiment."
         ),
     )
     parser.add_argument(
@@ -189,12 +205,18 @@ def encoder_cache_dir(
     dataset: str,
     feature_mode: str,
     model_id: str,
+    fine_tune_bert: bool = True,
 ) -> Path:
     path = cache_root / dataset
-    if feature_mode in {"raw", "rating-only"}:
+    if feature_mode != "full":
         path = path / feature_mode
-    if model_id != DEFAULT_BERT_MODEL:
+    # Preserve the historical BERT-base cache at the dataset root. Every
+    # newer encoder receives its own directory, including the new default
+    # ModernBERT, so changing defaults cannot overwrite an old checkpoint.
+    if model_id != LEGACY_BERT_MODEL:
         path = path / "encoders" / bert_model_slug(model_id)
+    if not fine_tune_bert:
+        path = path / "pretrained-only"
     return path
 
 
@@ -224,6 +246,7 @@ def set_seed(seed: int) -> None:
 def split_fingerprint(
     train_df: pd.DataFrame,
     valid_df: pd.DataFrame,
+    test_df: pd.DataFrame,
     *,
     seed: int,
     feature_mode: str = "full",
@@ -232,6 +255,8 @@ def split_fingerprint(
     digest = hashlib.sha256(f"split-seed={seed}\n".encode())
     if feature_mode == "raw":
         fields = ("reviewerID", "asin", "overall", "reviewText")
+    elif feature_mode == "review-only":
+        fields = ("reviewerID", "asin", "overall", "filteredReviewText")
     elif feature_mode == "rating-only":
         fields = ("reviewerID", "asin", "overall_new", "reviewText")
     else:
@@ -247,6 +272,22 @@ def split_fingerprint(
             )
             digest.update(line.encode("utf-8"))
             digest.update(b"\n")
+    test_text_field = (
+        "reviewText" if feature_mode in {"raw", "rating-only"}
+        else "filteredReviewText"
+    )
+    digest.update(b"[test]\n")
+    for values in test_df.loc[
+        :, ("reviewerID", "asin", "overall", test_text_field)
+    ].itertuples(index=False, name=None):
+        line = json.dumps(
+            [None if pd.isna(value) else value for value in values],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        digest.update(line.encode("utf-8"))
+        digest.update(b"\n")
     return digest.hexdigest()
 
 
@@ -331,11 +372,13 @@ def result_path(
     max_topics_per_word: int,
     feature_mode: str,
     bert_model: str,
+    fine_tune_bert: bool,
     seed: int,
 ) -> Path:
     experiment = (
         f"k{NUM_TOPICS}_words{num_words}_tpw{max_topics_per_word}_"
-        f"{feature_mode}{encoder_suffix(bert_model)}_seed{seed}_"
+        f"{feature_mode}{encoder_suffix(bert_model)}"
+        f"{'_pretrained-only' if not fine_tune_bert else ''}_seed{seed}_"
         f"v{FEATURE_PIPELINE_VERSION}"
     )
     return output_dir / dataset / experiment / method_slug / "metrics.json"
@@ -352,6 +395,7 @@ def valid_cached_result(
     max_topics_per_word: int,
     feature_mode: str,
     bert_model: str,
+    fine_tune_bert: bool,
 ) -> dict[str, Any] | None:
     result = read_json(path)
     expected = {
@@ -364,12 +408,16 @@ def valid_cached_result(
         "epochs": epochs,
         "batchSize": batch_size,
         "seed": seed,
+        "groundTruthField": "overall",
+        "splitBeforePreprocessing": True,
     }
-    if bert_model != DEFAULT_BERT_MODEL:
-        expected["bertModel"] = bert_model
+    expected["bertModel"] = bert_model
     if result is None or any(
         result.get(key) != value for key, value in expected.items()
     ):
+        return None
+    # Results created before this option existed were always fine-tuned.
+    if result.get("bertFineTuned", True) != fine_tune_bert:
         return None
     required = ("accuracy", "rmse", "mae")
     return result if all(key in result for key in required) else None
@@ -388,6 +436,7 @@ def main() -> None:
     )
     print(f"Feature mode: {args.feature_mode}")
     print(f"BERT encoder: {args.bert_model}")
+    print(f"BERT fine-tuning: {args.fine_tune_bert}")
     print("Clustering methods: " + ", ".join(name for name, _ in methods))
     uses_bert = True
     print("BERT policy: one checkpoint + embeddings + coarse scores per dataset")
@@ -398,6 +447,7 @@ def main() -> None:
                 dataset,
                 args.feature_mode,
                 args.bert_model,
+                args.fine_tune_bert,
             )
             print(f"  {dataset}: {path} -> {cache_dir}")
         return
@@ -417,6 +467,7 @@ def main() -> None:
         fingerprint = split_fingerprint(
             train_df,
             valid_df,
+            test_df,
             seed=args.seed,
             feature_mode=args.feature_mode,
         )
@@ -427,20 +478,28 @@ def main() -> None:
             dataset,
             args.feature_mode,
             args.bert_model,
+            args.fine_tune_bert,
         )
         manifest_path = cache_dir / "manifest.json"
         manifest = read_json(manifest_path)
         cache_matches = (
             manifest is not None
             and manifest.get("splitFingerprint") == fingerprint
-            and (cache_dir / "bert_last_checkpoint.pt").is_file()
+            and manifest.get("featureMode") == args.feature_mode
+            and manifest.get("bertModel", LEGACY_BERT_MODEL) == args.bert_model
+            # Legacy manifests always represent the former fine-tuned mode.
+            and manifest.get("bertFineTuned", True) == args.fine_tune_bert
+            and (
+                not args.fine_tune_bert
+                or (cache_dir / "bert_last_checkpoint.pt").is_file()
+            )
         )
         cache_reset = args.force_bert or not cache_matches
         if cache_reset:
             reset_bert_cache(cache_dir)
             print(
-                "BERT cache is missing/stale; the first method will train "
-                "BERT once."
+                "BERT cache is missing/stale; the first method will prepare "
+                "the configured encoder once."
             )
         else:
             print(f"Reusing dataset BERT cache: {cache_dir}")
@@ -448,14 +507,20 @@ def main() -> None:
         manifest_value = {
             "dataset": dataset,
             "datasetPath": str(json_path.resolve()),
+            "splitDirectory": str(
+                (json_path.parent / "splits" / json_path.stem).resolve()
+            ),
             "splitFingerprint": fingerprint,
             "featureMode": args.feature_mode,
             "bertModel": args.bert_model,
+            "bertFineTuned": args.fine_tune_bert,
             "seed": args.seed,
             "trainRows": len(train_df),
             "validRows": len(valid_df),
             "testRows": len(test_df),
             "featurePipelineVersion": FEATURE_PIPELINE_VERSION,
+            "groundTruthField": "overall",
+            "splitBeforePreprocessing": True,
         }
         write_json_atomic(manifest_path, manifest_value)
 
@@ -469,6 +534,7 @@ def main() -> None:
                 max_topics_per_word=args.max_topics_per_word,
                 feature_mode=args.feature_mode,
                 bert_model=args.bert_model,
+                fine_tune_bert=args.fine_tune_bert,
                 seed=args.seed,
             )
             cached_result = None
@@ -483,6 +549,7 @@ def main() -> None:
                     max_topics_per_word=args.max_topics_per_word,
                     feature_mode=args.feature_mode,
                     bert_model=args.bert_model,
+                    fine_tune_bert=args.fine_tune_bert,
                 )
             if cached_result is None:
                 pending.append((method_name, method_slug, path))
@@ -524,6 +591,7 @@ def main() -> None:
                 feature_mode=args.feature_mode,
                 cluster_seed=args.seed,
                 bert_model=args.bert_model,
+                bert_fine_tuning=args.fine_tune_bert,
             )
             train_loader = csv_to_dataloader(
                 feature_paths["train"], args.batch_size, shuffle=True
@@ -549,6 +617,9 @@ def main() -> None:
             metrics = {
                 "schemaVersion": FEATURE_PIPELINE_VERSION,
                 "dataset": dataset,
+                "splitDirectory": str(
+                    (json_path.parent / "splits" / json_path.stem).resolve()
+                ),
                 "method": "PreBERT",
                 "clusterMethod": method_name,
                 "topics": NUM_TOPICS,
@@ -556,6 +627,10 @@ def main() -> None:
                 "maxTopicsPerWord": args.max_topics_per_word,
                 "featureMode": args.feature_mode,
                 "bertModel": args.bert_model,
+                "bertFineTuned": args.fine_tune_bert,
+                "coarseSentimentMethod": (
+                    "fine-tuned-bert" if args.fine_tune_bert else "vader"
+                ),
                 "epochs": args.epochs,
                 "batchSize": args.batch_size,
                 "seed": args.seed,
@@ -568,7 +643,9 @@ def main() -> None:
                 "mae": float(mae),
                 "elapsedSeconds": elapsed,
                 "bertCheckpoint": (
-                    str(cache_dir / "bert_last_checkpoint.pt") if uses_bert else None
+                    str(cache_dir / "bert_last_checkpoint.pt")
+                    if uses_bert and args.fine_tune_bert
+                    else None
                 ),
                 "bertEmbeddings": (
                     str(
@@ -587,9 +664,19 @@ def main() -> None:
                     if args.feature_mode in {"raw", "rating-only"}
                     else "filteredReviewText"
                 ),
-                "ratingField": (
-                    "overall" if args.feature_mode == "raw" else "overall_new"
+                "ratingField": "overall",
+                "trainingRatingField": (
+                    "overall_new"
+                    if args.feature_mode in {"rating-only", "full"}
+                    else "overall"
                 ),
+                "validationRatingField": (
+                    "overall_new"
+                    if args.feature_mode in {"rating-only", "full"}
+                    else "overall"
+                ),
+                "groundTruthField": "overall",
+                "splitBeforePreprocessing": True,
                 "featureDiagnostics": feature_paths["featureDiagnostics"],
             }
             write_json_atomic(metrics_path, metrics)
@@ -611,6 +698,7 @@ def main() -> None:
             f"clustering_ablation_k{NUM_TOPICS}_words{args.num_words}_"
             f"tpw{args.max_topics_per_word}_{args.feature_mode}"
             f"{encoder_suffix(args.bert_model)}_"
+            f"{'pretrained-only_' if not args.fine_tune_bert else ''}"
             f"seed{args.seed}_v{FEATURE_PIPELINE_VERSION}.csv"
         )
         summary_frame.to_csv(summary_path, index=False)

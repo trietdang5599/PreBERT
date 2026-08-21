@@ -273,7 +273,7 @@ def test_rsme(model, data_loader):
     return calculate_rmse(targets, predicts), mae_value
 
 def _interaction_frame(dataset_df):
-    rating_field = "overall_new" if "overall_new" in dataset_df else "overall"
+    rating_field = "modelRating" if "modelRating" in dataset_df else "overall"
     frame = pd.DataFrame(
         {
             "reviewerID": dataset_df["reviewerID"].astype(str),
@@ -374,18 +374,6 @@ def _create_deep_embeddings(
     return result
 
 
-def _create_review_only_embeddings(identifiers, review_features, num_factors):
-    normalized_features = {
-        str(key): np.asarray(value, dtype=np.float32)
-        for key, value in review_features.items()
-    }
-    fallback = _mean_feature(normalized_features, num_factors)
-    return {
-        identifier: normalized_features.get(identifier, fallback).copy()
-        for identifier in sorted({str(value) for value in identifiers})
-    }
-
-
 def _build_final_feature_frame(
     dataset_df,
     user_embeddings,
@@ -411,6 +399,37 @@ def _build_final_feature_frame(
     )
 
 
+def apply_preprocessing_mode(train_df, valid_df, test_df, feature_mode):
+    """Select model inputs while keeping the test label immutable."""
+    if feature_mode not in {"full", "review-only", "rating-only", "raw"}:
+        raise ValueError(f"Unsupported preprocessing mode: {feature_mode}")
+    uses_filtered_review = feature_mode in {"review-only", "full"}
+    uses_adjusted_training_rating = feature_mode in {"rating-only", "full"}
+
+    def select_fields(frame, *, is_test=False):
+        selected_frame = frame.copy()
+        if not uses_filtered_review:
+            selected_frame["filteredReviewText"] = selected_frame["reviewText"]
+        if is_test:
+            selected_frame["modelRating"] = selected_frame["overall"]
+        elif uses_adjusted_training_rating:
+            if "overall_new" not in selected_frame:
+                raise ValueError("train/validation split is missing overall_new")
+            selected_frame["modelRating"] = selected_frame["overall_new"]
+        else:
+            selected_frame["modelRating"] = selected_frame["overall"]
+        # Review-feature code historically consumes overall_new. Keep it as
+        # an internal working label after the public input contract is applied.
+        selected_frame["overall_new"] = selected_frame["modelRating"]
+        return selected_frame
+
+    return (
+        select_fields(train_df),
+        select_fields(valid_df),
+        select_fields(test_df, is_test=True),
+    )
+
+
 def prepare_deepbert_splits(
     train_df,
     valid_df,
@@ -424,9 +443,10 @@ def prepare_deepbert_splits(
     max_topics_per_word=2,
     feature_mode="full",
     cluster_seed=42,
-    bert_model="bert-base-uncased",
+    bert_model="answerdotai/ModernBERT-base",
+    bert_fine_tuning=True,
 ):
-    """Fit every feature model on train and transform valid/test without fitting."""
+    """Fit on fixed train/validation splits and evaluate original test ratings."""
     if feature_mode not in {"full", "review-only", "rating-only", "raw"}:
         raise ValueError(
             "feature_mode must be one of: 'full', 'review-only', "
@@ -446,20 +466,9 @@ def prepare_deepbert_splits(
         sparse_matrix_path,
     ) = setup_path()
 
-    if feature_mode in {"raw", "rating-only"}:
-        # Both modes keep the original review text. Raw also restores the
-        # original rating, while rating-only isolates rating adjustment by
-        # retaining overall_new as both the fitted rating and ground truth.
-        def select_ablation_fields(frame):
-            selected_frame = frame.copy()
-            selected_frame["filteredReviewText"] = selected_frame["reviewText"]
-            if feature_mode == "raw":
-                selected_frame["overall_new"] = selected_frame["overall"]
-            return selected_frame
-
-        train_df = select_ablation_fields(train_df)
-        valid_df = select_ablation_fields(valid_df)
-        test_df = select_ablation_fields(test_df)
+    train_df, valid_df, test_df = apply_preprocessing_mode(
+        train_df, valid_df, test_df, feature_mode
+    )
 
     train_interactions = _interaction_frame(train_df)
     valid_interactions = _interaction_frame(valid_df)
@@ -485,6 +494,7 @@ def prepare_deepbert_splits(
         max_topics_per_word=max_topics_per_word,
         cluster_seed=cluster_seed,
         bert_model=bert_model,
+        bert_fine_tuning=bert_fine_tuning,
     )
     feature_diagnostics = _fine_feature_diagnostics(
         train_review_rows,
@@ -503,52 +513,40 @@ def prepare_deepbert_splits(
     create_and_write_csv("reviewer_feature_train", reviewer_features)
     create_and_write_csv("item_feature_train", item_features)
 
-    if feature_mode in {"full", "rating-only", "raw"}:
-        interaction_path = "feature/interactions_train.csv"
-        train_interactions.to_csv(interaction_path, index=False)
-        svd = initialize_svd(
-            interaction_path,
-            num_factors,
-            svd_path + "train.pt",
-            validation_data=valid_interactions,
-        )
-        fm = run(
-            interaction_path,
-            num_factors * 2,
-            checkpoint_path + "train.pkl",
-            sparse_matrix_path + "train.npz",
-            validation_data=valid_interactions,
-        )
-        user_embeddings = _create_deep_embeddings(
-            all_users,
-            reviewer_features,
-            svd,
-            fm,
-            entity="reviewer",
-            num_factors=num_factors,
-        )
-        item_embeddings = _create_deep_embeddings(
-            all_items,
-            item_features,
-            svd,
-            fm,
-            entity="item",
-            num_factors=num_factors,
-        )
-        _, user_biases, item_biases = _fit_regularized_biases(train_interactions)
-    else:
-        user_embeddings = _create_review_only_embeddings(
-            all_users,
-            reviewer_features,
-            num_factors,
-        )
-        item_embeddings = _create_review_only_embeddings(
-            all_items,
-            item_features,
-            num_factors,
-        )
-        user_biases = {}
-        item_biases = {}
+    # All four preprocessing modes use the same PreBERT architecture. Only
+    # input text/rating preprocessing changes between modes.
+    interaction_path = "feature/interactions_train.csv"
+    train_interactions.to_csv(interaction_path, index=False)
+    svd = initialize_svd(
+        interaction_path,
+        num_factors,
+        svd_path + "train.pt",
+        validation_data=valid_interactions,
+    )
+    fm = run(
+        interaction_path,
+        num_factors * 2,
+        checkpoint_path + "train.pkl",
+        sparse_matrix_path + "train.npz",
+        validation_data=valid_interactions,
+    )
+    user_embeddings = _create_deep_embeddings(
+        all_users,
+        reviewer_features,
+        svd,
+        fm,
+        entity="reviewer",
+        num_factors=num_factors,
+    )
+    item_embeddings = _create_deep_embeddings(
+        all_items,
+        item_features,
+        svd,
+        fm,
+        entity="item",
+        num_factors=num_factors,
+    )
+    _, user_biases, item_biases = _fit_regularized_biases(train_interactions)
     create_and_write_csv("u_deep_train", user_embeddings)
     create_and_write_csv("i_deep_train", item_embeddings)
 

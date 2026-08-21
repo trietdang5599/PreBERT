@@ -15,8 +15,8 @@
     "5.0": 5372
   },
   "source_url": "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Toys_and_Games_5.json.gz",
-  "source_cache": "/Users/trietdang/Triet-Applications/PreBERT/data/raw/reviews_Toys_and_Games_5.json.gz",
-  "output": "/Users/trietdang/Triet-Applications/PreBERT/data/Small_Toys_and_Games_5_dense10k.json",
+  "source_cache": "data/raw/reviews_Toys_and_Games_5.json.gz",
+  "output": "data/Small_Toys_and_Games_5_dense10k.json",
   "seed": 2026,
   "k_core": 5
 }

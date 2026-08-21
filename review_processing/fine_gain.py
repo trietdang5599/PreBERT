@@ -9,7 +9,13 @@ from tqdm import tqdm
 from nltk.corpus import sentiwordnet as swn
 from sklearn.cluster import KMeans, Birch, DBSCAN, MeanShift, BisectingKMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
-from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+)
+from transformers.utils import logging as transformers_logging
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence
@@ -18,6 +24,37 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 from helper.general_functions import preprocessed, word_segment
 from helper.device import get_device
+
+
+def _load_classifier_for_fine_tuning(model_name_or_path, num_labels):
+    """Load a pretrained encoder with a fresh task head without a false alarm.
+
+    Base encoder checkpoints such as ModernBERT or ``bert-base-uncased`` do not
+    contain sequence-classification weights. Transformers reports that as
+    a warning even though this function immediately fine-tunes the complete
+    model below. Capture the loading information and replace that warning with
+    an explicit training message; real loading failures still raise normally.
+    """
+    previous_verbosity = transformers_logging.get_verbosity()
+    try:
+        transformers_logging.set_verbosity_error()
+        model, loading_info = AutoModelForSequenceClassification.from_pretrained(
+            model_name_or_path,
+            num_labels=num_labels,
+            attn_implementation="eager",
+            output_loading_info=True,
+        )
+    finally:
+        transformers_logging.set_verbosity(previous_verbosity)
+
+    initialized_parameters = loading_info.get("missing_keys", [])
+    if initialized_parameters:
+        print(
+            "Initialized a new sequence-classification head for "
+            f"{num_labels} labels; it will now be fine-tuned on the training "
+            "split."
+        )
+    return model
 
 
 class CustomDataset(Dataset):
@@ -79,7 +116,8 @@ def fine_tune_bert(
     save_dir="./chkpt",
     validation_texts=None,
     validation_labels=None,
-    model_name_or_path="bert-base-uncased",
+    model_name_or_path="answerdotai/ModernBERT-base",
+    fine_tune=True,
 ):
     device = get_device()
     print(f"Using device: {device}")
@@ -95,6 +133,16 @@ def fine_tune_bert(
                 f"Tokenizer for {model_name_or_path} has no padding fallback token"
             )
         tokenizer.pad_token = fallback_token
+
+    if not fine_tune:
+        model = AutoModel.from_pretrained(
+            model_name_or_path,
+            attn_implementation="eager",
+        ).to(device)
+        model.requires_grad_(False)
+        model.eval()
+        print(f"Using frozen pretrained BERT encoder: {model_name_or_path}")
+        return model, tokenizer
 
     if checkpoint_path.is_file():
         print(f"Checkpoint found at {checkpoint_path}. Loading checkpoint.")
@@ -153,11 +201,7 @@ def fine_tune_bert(
             num_workers=0,
             collate_fn=collate_fn(tokenizer),
         )
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name_or_path,
-        num_labels=num_labels,
-        attn_implementation="eager",
-    )
+    model = _load_classifier_for_fine_tuning(model_name_or_path, num_labels)
     model = model.to(device) 
 
     optimizer = AdamW(model.parameters(), lr=learning_rate)
@@ -373,7 +417,8 @@ def get_tbert_model(
     embeddings_cache_path=None,
     max_topics_per_word=2,
     cluster_seed=42,
-    bert_model="bert-base-uncased",
+    bert_model="answerdotai/ModernBERT-base",
+    bert_fine_tuning=True,
 ):
     device = get_device()
     if max_topics_per_word <= 0:
@@ -405,6 +450,7 @@ def get_tbert_model(
         validation_texts=validation_texts,
         validation_labels=validation_labels,
         model_name_or_path=bert_model,
+        fine_tune=bert_fine_tuning,
     )
     model = model.to(device)
     

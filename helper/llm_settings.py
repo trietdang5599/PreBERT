@@ -24,18 +24,23 @@ MODEL_ALIASES = {
     "llama3.2_3b_base": "meta-llama/Llama-3.2-3B",
 }
 
+GROUND_TRUTH_FIELD = "overall"
+
+# Evaluation always measures predictions against the original Amazon rating.
+# Mode names are retained for compatibility with existing commands and output
+# paths; they now vary only the review text presented to the model.
 MODE_FIELDS = {
-    "pretrained": ("reviewText", "overall"),
-    "pretrained-processed": ("filteredReviewText", "overall_new"),
-    "pretrained-processed-mix": ("filteredReviewText", "overall"),
-    "pretrained-rating-only": ("reviewText", "overall_new"),
+    "pretrained": ("reviewText", GROUND_TRUTH_FIELD),
+    "pretrained-processed": ("filteredReviewText", GROUND_TRUTH_FIELD),
+    "pretrained-processed-mix": ("filteredReviewText", GROUND_TRUTH_FIELD),
+    "pretrained-rating-only": ("reviewText", GROUND_TRUTH_FIELD),
 }
 
 MODE_DESCRIPTIONS = {
     "pretrained": "baseline: original review text + original rating",
     "pretrained-processed-mix": "text-only ablation: filtered text + original rating",
-    "pretrained-rating-only": "rating-only ablation: original text + adjusted rating",
-    "pretrained-processed": "full preprocessing: filtered text + adjusted rating",
+    "pretrained-rating-only": "legacy alias: original text + original ground truth",
+    "pretrained-processed": "filtered text + original ground truth",
 }
 
 DEFAULT_DATASETS = (
@@ -92,7 +97,7 @@ def load_model_and_tokenizer(args: Any, model_id: str) -> tuple[Any, Any]:
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
     except ImportError as exc:
         raise RuntimeError(
-            "Missing LLM dependencies. Run: pip install -r exp_llm/requirements.txt"
+            "Missing LLM dependencies. Run: pip install -r requirements.txt"
         ) from exc
 
     tokenizer = AutoTokenizer.from_pretrained(

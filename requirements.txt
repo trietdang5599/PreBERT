@@ -1,4 +1,5 @@
 certifi==2025.8.3
+accelerate>=1.0
 charset-normalizer==3.4.3
 click==8.2.1
 et_xmlfile==2.0.0
@@ -38,3 +39,6 @@ typing_extensions==4.14.1
 tzdata==2025.2
 urllib3==2.5.0
 vaderSentiment==3.3.2
+
+# Optional: required only by --use-4bit on NVIDIA CUDA.
+# bitsandbytes>=0.43

@@ -2,20 +2,68 @@
 
 All commands below can be run from any directory. The shell launchers resolve
 the repository and `.venv` automatically. Set `PYTHON=/path/to/python` to use a
-different environment.
+different environment. Each file under `scripts/` has a `USER CONFIGURATION`
+block at the top, so modes, datasets, models, seeds, devices, and output paths
+can be selected by editing the launcher and then running it without arguments.
+
+## Full thesis pipeline
+
+The repository launchers are preconfigured with the complete experiment
+matrix used in the thesis. Run the whole workflow in this order with:
+
+```bash
+./scripts/run_evaluations.sh
+```
+
+The dispatcher runs:
+
+1. `run_preprocessing.sh`: build the dense Toys and Games subset, preprocess
+   all three domains with Llama 3.2 3B Instruct, derive deterministic 80/10/10
+   assignments from the original datasets, then map processed fields onto
+   those preassigned rows.
+2. `run_prebert.sh`: main results plus preprocessing, clustering, and encoder
+   ablations.
+3. `run_llm.sh`: 3 datasets x 4 pretrained LLMs x 4 text/rating modes.
+4. `run_semantic_retention.sh`: semantic-retention evaluation for all three
+   processed datasets.
+
+Existing `*_llama_filtered.json` files are reused by default, so splitting can
+be regenerated without another expensive LLM preprocessing pass. In
+`run_preprocessing.sh`, set `REUSE_EXISTING_PROCESSED=false` and
+`OVERWRITE_PROCESSED=true` to reproduce preprocessing from scratch.
+
+Each stage can also be run independently:
+
+```bash
+./scripts/run_preprocessing.sh
+./scripts/run_prebert.sh
+./scripts/run_llm.sh
+./scripts/run_semantic_retention.sh
+```
+
+To use BERT only as a frozen pretrained encoder, set
+`FINE_TUNE_BERT=false` in `scripts/run_prebert.sh`. This mode does not create a
+random classification head: it uses pretrained BERT embeddings for clustering
+and VADER for the coarse sentiment score. Its caches and result paths are
+isolated with a `pretrained-only` suffix.
 
 ## PreBERT
 
-`evaluation.py` is the public entry point. It expands a named mode and delegates
-every run to the same cached experiment engine in `run_clustering_ablation.py`.
+`experiments/evaluation.py` is the public entry point. It expands a named mode
+and delegates every run to the cached engine in
+`experiments/run_clustering_ablation.py`.
 
 | Mode | Feature modes | Clustering | Encoder |
 |---|---|---|---|
-| `main` | `full` | Birch | BERT base |
-| `preprocessing-ablation` | `raw`, `review-only`, `rating-only`, `full` | Birch | BERT base |
-| `clustering-ablation` | `full` | K-Means, Birch, Bisecting K-Means, DBSCAN | BERT base |
+| `main` | `full` | Birch | ModernBERT |
+| `preprocessing-ablation` | `raw`, `review-only`, `rating-only`, `full` | Birch | ModernBERT |
+| `clustering-ablation` | `full` | K-Means, Birch, Bisecting K-Means, DBSCAN | ModernBERT |
 | `encoder-ablation` | `full` | Birch | BERT base, ModernBERT, mmBERT |
 | `custom` | CLI values | CLI values | CLI values |
+
+ModernBERT (`answerdotai/ModernBERT-base`) is the default encoder for the main,
+preprocessing-ablation, and clustering-ablation presets. The encoder ablation
+still evaluates ModernBERT, BERT base, and mmBERT.
 
 Examples:
 
@@ -40,16 +88,26 @@ Dataset splitting and legacy artifact cleanup are centralized in
 `helper/experiment_data.py`. Dataset/model/mode caches remain isolated by the
 experiment engine, so an existing compatible BERT checkpoint is reused.
 
+The preprocessing modes form a controlled 2x2 ablation while retaining the
+same PreBERT architecture: `raw` uses original text/rating, `review-only` uses
+filtered text/original rating, `rating-only` uses original text/adjusted
+train-validation rating, and `full` uses filtered text/adjusted
+train-validation rating. Every mode loads the precomputed physical splits and
+evaluates the test split against the immutable `overall` field.
+
 ## LLM rating evaluation
 
 Runtime environment defaults, model aliases, input-field mappings, and model
-loading are centralized in `exp_llm/llm_settings.py`. The public Python entry
-point is `python -m exp_llm`; implementation modules are not called directly.
+loading are centralized in `helper/llm_settings.py`. The public experiment entry
+point is `python -m experiments`; dataset preparation uses the root-level
+`preprocessing_reviews.py` command.
+Rating splits are built from the original JSONL before fields from the matching
+preprocessed JSONL are mapped onto each split.
 
 | Shell preset | LLM modes |
 |---|---|
 | `main` | `pretrained`, `pretrained-processed` |
-| `ablation` | all four combinations of original/filtered text and old/new rating |
+| `ablation` | all four legacy modes; metrics always use `overall` as ground truth |
 | `baseline` | `pretrained` |
 | `processed` | `pretrained-processed` |
 
@@ -72,12 +130,14 @@ Arguments intended for each individual `rating` run can be forwarded after
 Equivalent commands without the shell presets:
 
 ```bash
-python -m exp_llm rating --dataset data/Small_All_Beauty_5_llama_filtered.json \
+python -m experiments rating --dataset data/Small_All_Beauty_5_llama_filtered.json \
   --model llama3.2_1b --mode pretrained
-python -m exp_llm rating-matrix --modes pretrained pretrained-processed
-python -m exp_llm preprocess data/input.json --output data/output.json
-python -m exp_llm semantic data/output.json --output-dir exp_llm/semantic_outputs/example
-python -m exp_llm build-dataset --target-size 10000
+python -m experiments rating-matrix --modes pretrained pretrained-processed
+python preprocessing_reviews.py preprocess data/input.json --output data/output.json
+python preprocessing_reviews.py build-dataset --target-size 10000
+python preprocessing_reviews.py split data/output_llama_filtered.json
+python -m experiments semantic data/output.json \
+  --output-dir experiments/semantic_outputs/example
 ```
 
 ## Other evaluation

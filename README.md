@@ -14,8 +14,8 @@ In summary, the contributions of this work are threefold:
 
 In this study, we use Stanford CoreNLP. Please make sure the device has the required model installed and that `JAVA_HOME` is set up properly on the device.
 
-After that, install `requirements.txt` and use the mode-based experiment
-launchers. For example, run the main PreBERT result with:
+After that, install the project's single `requirements.txt` and use the
+mode-based experiment launchers. For example, run the main PreBERT result with:
 
 ```bash
 ./scripts/run_prebert.sh main
@@ -23,3 +23,9 @@ launchers. For example, run the main PreBERT result with:
 
 Main results, ablations, LLM evaluation, and semantic-retention commands are
 documented in [EXPERIMENTS.md](EXPERIMENTS.md).
+
+Dataset construction, LLM preprocessing, and deterministic 80/10/10 splitting
+are unified in `preprocessing_reviews.py`. The configurable multi-dataset
+workflow is available in `Preprocessing-Datasets.ipynb`. Experiment runners and
+outputs live under `experiments/`, while shared runtime settings live in
+`helper/llm_settings.py`.

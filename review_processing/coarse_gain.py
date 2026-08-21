@@ -1,4 +1,8 @@
 import torch
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+
+
+_vader = SentimentIntensityAnalyzer()
 
 def get_coarse_sentiment_score(model, tokenizer, text):
     device = next(model.parameters()).device
@@ -18,3 +22,9 @@ def get_coarse_sentiment_score(model, tokenizer, text):
     sentiment_score = lower_bound + highest_prob * (upper_bound - lower_bound)
     
     return sentiment_score
+
+
+def get_vader_coarse_sentiment_score(text):
+    """Return a deterministic [0, 1] score when no BERT head is trained."""
+    compound = _vader.polarity_scores(text or "")["compound"]
+    return (compound + 1.0) / 2.0

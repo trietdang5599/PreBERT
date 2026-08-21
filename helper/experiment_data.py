@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
-from helper.utils import read_data
-
-
-DATA_COLUMNS = (
-    "reviewerID",
-    "asin",
-    "overall",
-    "overall_new",
-    "reviewText",
-    "filteredReviewText",
-)
+def _read_jsonl_records(path: Path) -> list[dict]:
+    records = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON at {path}:{line_number}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"Expected an object at {path}:{line_number}")
+            records.append(record)
+    return records
 
 
 def create_dataframes(
@@ -27,67 +30,59 @@ def create_dataframes(
     test_ratio: float = 0.1,
     seed: int = 42,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Load a dataset and create deterministic warm-start splits."""
-    if not np.isclose(train_ratio + valid_ratio + test_ratio, 1.0):
-        raise ValueError("train, validation, and test ratios must sum to 1")
-    if min(train_ratio, valid_ratio, test_ratio) <= 0:
-        raise ValueError("train, validation, and test ratios must be positive")
-    data = read_data(str(json_file))
-    frame = pd.DataFrame(data, columns=DATA_COLUMNS)
+    """Load the immutable pre-preprocessing train/validation/test assignment.
 
-    rng = np.random.default_rng(seed)
-    user_values = frame["reviewerID"].astype(str).to_numpy()
-    item_values = frame["asin"].astype(str).to_numpy()
-    user_counts = pd.Series(user_values).value_counts().to_dict()
-    item_counts = pd.Series(item_values).value_counts().to_dict()
-    target_holdout = int(round((valid_ratio + test_ratio) * len(frame)))
-    holdout_indices: list[int] = []
-
-    for index in rng.permutation(len(frame)):
-        user = user_values[index]
-        item = item_values[index]
-        if user_counts[user] > 1 and item_counts[item] > 1:
-            holdout_indices.append(int(index))
-            user_counts[user] -= 1
-            item_counts[item] -= 1
-            if len(holdout_indices) >= target_holdout:
-                break
-
-    if len(holdout_indices) < target_holdout:
-        print(
-            f"Warm-start split retained only {len(holdout_indices)}/{target_holdout} "
-            "requested validation/test rows because the sampled dataset contains "
-            "cold-start users/items."
+    ``train_ratio``, ``valid_ratio``, ``test_ratio``, and ``seed`` remain in
+    the signature for API compatibility. Splitting is owned exclusively by
+    ``preprocessing_reviews.py split`` and is never repeated during an
+    experiment.
+    """
+    del train_ratio, valid_ratio, test_ratio, seed
+    dataset_path = Path(json_file)
+    split_dir = dataset_path.parent / "splits" / dataset_path.stem
+    paths = {
+        "train": split_dir / "train.json",
+        "validation": split_dir / "val.json",
+        "test": split_dir / "test.json",
+    }
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Precomputed dataset split(s) not found: " + ", ".join(missing)
         )
-    if len(holdout_indices) < 2:
-        raise ValueError("Not enough warm-start interactions for validation and test")
 
-    rng.shuffle(holdout_indices)
-    valid_share = valid_ratio / (valid_ratio + test_ratio)
-    valid_size = max(1, int(round(len(holdout_indices) * valid_share)))
-    valid_indices = holdout_indices[:valid_size]
-    test_indices = holdout_indices[valid_size:]
-    train_indices = np.setdiff1d(
-        np.arange(len(frame)),
-        np.asarray(holdout_indices),
-        assume_unique=False,
+    rows = {name: _read_jsonl_records(path) for name, path in paths.items()}
+    frames = {name: pd.DataFrame(values) for name, values in rows.items()}
+    required = {"reviewerID", "asin", "overall", "reviewText", "filteredReviewText"}
+    for name, frame in frames.items():
+        absent = required.difference(frame.columns)
+        if absent:
+            raise ValueError(
+                f"{paths[name]} is missing required field(s): {sorted(absent)}"
+            )
+        if frame.empty:
+            raise ValueError(f"{paths[name]} is empty")
+
+    for name in ("train", "validation"):
+        if (
+            "overall_new" not in frames[name]
+            or frames[name]["overall_new"].isna().any()
+        ):
+            raise ValueError(f"{paths[name]} must contain non-null overall_new")
+    if "overall_new" in frames["test"].columns:
+        raise ValueError(
+            f"{paths['test']} must not contain overall_new; test ground truth is overall"
+        )
+
+    train_frame = frames["train"].reset_index(drop=True)
+    valid_frame = frames["validation"].reset_index(drop=True)
+    test_frame = frames["test"].reset_index(drop=True)
+    frame = pd.concat(
+        [train_frame, valid_frame, test_frame], ignore_index=True, sort=False
     )
-
-    train_frame = frame.iloc[train_indices].reset_index(drop=True)
-    valid_frame = frame.iloc[valid_indices].reset_index(drop=True)
-    test_frame = frame.iloc[test_indices].reset_index(drop=True)
-
-    train_users = set(train_frame["reviewerID"].astype(str))
-    train_items = set(train_frame["asin"].astype(str))
-    for split_name, split_frame in (("valid", valid_frame), ("test", test_frame)):
-        if not set(split_frame["reviewerID"].astype(str)).issubset(train_users):
-            raise RuntimeError(f"{split_name} contains users absent from train")
-        if not set(split_frame["asin"].astype(str)).issubset(train_items):
-            raise RuntimeError(f"{split_name} contains items absent from train")
-
     print(
-        f"Split sizes: train={len(train_frame)}, valid={len(valid_frame)}, "
-        f"test={len(test_frame)} (100% warm-start validation/test)"
+        f"Loaded precomputed splits from {split_dir}: train={len(train_frame)}, "
+        f"valid={len(valid_frame)}, test={len(test_frame)}"
     )
     return frame, train_frame, valid_frame, test_frame
 

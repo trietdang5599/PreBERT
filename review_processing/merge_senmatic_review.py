@@ -8,7 +8,10 @@ import pandas as pd
 import numpy as np
 from helper.general_functions import create_and_write_csv, load_data_from_csv, split_text
 from init import dep_parser
-from review_processing.coarse_gain import get_coarse_sentiment_score
+from review_processing.coarse_gain import (
+    get_coarse_sentiment_score,
+    get_vader_coarse_sentiment_score,
+)
 from review_processing.fine_gain import get_tbert_model, get_topic_sentiment_matrix_tbert
 from helper.device import get_device, release_device_cache
 
@@ -63,6 +66,7 @@ def extract_review_feature(
     topic_word_matrix,
     num_topics,
     coarse_cache_path=None,
+    bert_fine_tuning=True,
 ):
     """Extract cluster-dependent fine features and reusable coarse scores.
 
@@ -115,9 +119,13 @@ def extract_review_feature(
                         try:
                             # Giữ tensor trên GPU trong quá trình tính toán
                             fine_feature_chunk = get_topic_sentiment_matrix_tbert(chunk, topic_word_matrix, dep_parser, topic_nums=num_topics)
-                            if not coarse_is_cached:
+                            if not coarse_is_cached and bert_fine_tuning:
                                 coarse_feature_chunk = get_coarse_sentiment_score(
                                     model, tokenizer, chunk
+                                )
+                            elif not coarse_is_cached:
+                                coarse_feature_chunk = (
+                                    get_vader_coarse_sentiment_score(chunk)
                                 )
                         except KeyError as e:
                             print(f"Skipping chunk due to missing key in vocabulary: {e}")
@@ -215,7 +223,8 @@ def extract_features(
     coarse_cache_path=None,
     max_topics_per_word=2,
     cluster_seed=42,
-    bert_model="bert-base-uncased",
+    bert_model="answerdotai/ModernBERT-base",
+    bert_fine_tuning=True,
 ):
     allreviews_path = "feature/allFeatureReview_"
     if os.path.exists(allreviews_path + filename +".csv"):
@@ -233,6 +242,7 @@ def extract_features(
             max_topics_per_word=max_topics_per_word,
             cluster_seed=cluster_seed,
             bert_model=bert_model,
+            bert_fine_tuning=bert_fine_tuning,
         )
         allFeatureReview = extract_review_feature(
             data_df,
@@ -242,6 +252,7 @@ def extract_features(
             topic_word_matrix,
             num_topics,
             coarse_cache_path=coarse_cache_path,
+            bert_fine_tuning=bert_fine_tuning,
         )
         allFeatureReview.to_csv(allreviews_path + filename +".csv", index=False)
         device = next(model.parameters()).device
