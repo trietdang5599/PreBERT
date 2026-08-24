@@ -31,13 +31,19 @@ import pandas as pd
 import torch
 
 from helper.device import get_device, release_device_cache
-from helper.experiment_data import create_dataframes, remove_generated_artifacts
+from helper.experiment_data import (
+    create_dataframes,
+    remove_generated_artifacts,
+    split_directory,
+)
 from helper.utils import csv_to_dataloader
 from train import prepare_deepbert_splits, test, test_rsme, train_deepbert
 
 
-NUM_TOPICS = 40
-FEATURE_PIPELINE_VERSION = 4
+DEFAULT_NUM_TOPICS = 40
+# v6: robust TF-IDF topic-word extraction keeps stop-word-only BIRCH clusters
+# from collapsing into empty vocabularies.
+FEATURE_PIPELINE_VERSION = 6
 DEFAULT_BERT_MODEL = "answerdotai/ModernBERT-base"
 LEGACY_BERT_MODEL = "bert-base-uncased"
 BERT_MODEL_ALIASES = {
@@ -84,11 +90,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
+        "--num-topics",
+        "--k-topic",
+        dest="num_topics",
+        type=int,
+        default=DEFAULT_NUM_TOPICS,
+        help=f"Number of topic clusters (default: {DEFAULT_NUM_TOPICS}).",
+    )
+    parser.add_argument(
         "--epochs",
         type=int,
         default=100,
         help="Maximum downstream-regressor epochs (default: 100).",
     )
+    parser.add_argument("--learning-rate", type=float, default=0.01)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--regressor-architecture",
+        choices=("linear", "fusion-mlp"),
+        default="linear",
+    )
+    parser.add_argument("--mlp-hidden-dim", type=int, default=64)
+    parser.add_argument("--mlp-dropout", type=float, default=0.1)
     parser.add_argument("--num-words", type=int, default=100)
     parser.add_argument(
         "--max-topics-per-word",
@@ -106,6 +129,33 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--split-profile",
+        choices=("8-1-1", "7-1-2"),
+        default="8-1-1",
+        help="Physical train/validation/test split ratio to load.",
+    )
+    parser.add_argument(
+        "--ground-truth-field",
+        choices=("overall", "overall_new"),
+        default="overall",
+        help="Test label used for metrics (default: overall).",
+    )
+    parser.add_argument(
+        "--rec-feature-ablation",
+        choices=("full", "without-review", "without-rating"),
+        default="full",
+        help=(
+            "PreBERT-Rec feature ablation: retain both feature branches, "
+            "or remove the review/rating branch."
+        ),
+    )
+    parser.add_argument(
+        "--standardize-deep-features",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Fit StandardScaler on train entity features before FM fusion.",
+    )
     parser.add_argument(
         "--bert-model",
         default=DEFAULT_BERT_MODEL,
@@ -156,15 +206,21 @@ def parse_args() -> argparse.Namespace:
     if (
         args.batch_size <= 0
         or args.epochs <= 0
+        or args.num_topics <= 0
         or args.num_words <= 0
         or args.max_topics_per_word <= 0
+        or args.learning_rate <= 0
+        or args.weight_decay < 0
+        or args.mlp_hidden_dim <= 0
+        or not 0 <= args.mlp_dropout < 1
     ):
         parser.error(
-            "--batch-size, --epochs, --num-words, and "
-            "--max-topics-per-word must be positive"
+            "--batch-size, --epochs, --num-topics, --num-words, "
+            "--max-topics-per-word, and --learning-rate must be positive; "
+            "--weight-decay must be non-negative"
         )
-    if args.max_topics_per_word > NUM_TOPICS:
-        parser.error(f"--max-topics-per-word cannot exceed {NUM_TOPICS}")
+    if args.max_topics_per_word > args.num_topics:
+        parser.error(f"--max-topics-per-word cannot exceed {args.num_topics}")
     unknown = [
         method for method in args.cluster_methods if method.lower() not in CLUSTER_METHODS
     ]
@@ -259,6 +315,7 @@ def split_fingerprint(
     *,
     seed: int,
     feature_mode: str = "full",
+    ground_truth_field: str = "overall",
 ) -> str:
     """Identify the exact data used for BERT fitting and model selection."""
     digest = hashlib.sha256(f"split-seed={seed}\n".encode())
@@ -287,7 +344,7 @@ def split_fingerprint(
     )
     digest.update(b"[test]\n")
     for values in test_df.loc[
-        :, ("reviewerID", "asin", "overall", test_text_field)
+        :, ("reviewerID", "asin", ground_truth_field, test_text_field)
     ].itertuples(index=False, name=None):
         line = json.dumps(
             [None if pd.isna(value) else value for value in values],
@@ -377,6 +434,7 @@ def result_path(
     dataset: str,
     method_slug: str,
     *,
+    num_topics: int,
     num_words: int,
     max_topics_per_word: int,
     feature_mode: str,
@@ -384,11 +442,26 @@ def result_path(
     fine_tune_bert: bool,
     balance_bert_classes: bool,
     seed: int,
+    ground_truth_field: str,
+    rec_feature_ablation: str,
+    split_profile: str,
+    standardize_deep_features: bool,
+    learning_rate: float,
+    weight_decay: float,
+    regressor_architecture: str,
+    mlp_hidden_dim: int,
+    mlp_dropout: float,
 ) -> Path:
     experiment = (
-        f"k{NUM_TOPICS}_words{num_words}_tpw{max_topics_per_word}_"
+        f"k{num_topics}_words{num_words}_tpw{max_topics_per_word}_"
         f"{feature_mode}{encoder_suffix(bert_model)}"
         f"{'_pretrained-only' if not fine_tune_bert else ''}_seed{seed}_"
+        f"gt-{ground_truth_field}_"
+        f"rec-{rec_feature_ablation}_"
+        f"{'deep-standardized_' if standardize_deep_features else ''}"
+        f"lr-{learning_rate:g}_wd-{weight_decay:g}_"
+        f"reg-{regressor_architecture}_h{mlp_hidden_dim}_do{mlp_dropout:g}_"
+        f"split-{split_profile.replace('-', '_')}_"
         f"{'unbalanced_' if fine_tune_bert and not balance_bert_classes else ''}"
         f"v{FEATURE_PIPELINE_VERSION}"
     )
@@ -399,6 +472,7 @@ def valid_cached_result(
     path: Path,
     fingerprint: str,
     *,
+    num_topics: int,
     num_words: int,
     epochs: int,
     batch_size: int,
@@ -408,19 +482,36 @@ def valid_cached_result(
     bert_model: str,
     fine_tune_bert: bool,
     balance_bert_classes: bool,
+    ground_truth_field: str,
+    rec_feature_ablation: str,
+    split_profile: str,
+    standardize_deep_features: bool,
+    learning_rate: float,
+    weight_decay: float,
+    regressor_architecture: str,
+    mlp_hidden_dim: int,
+    mlp_dropout: float,
 ) -> dict[str, Any] | None:
     result = read_json(path)
     expected = {
         "schemaVersion": FEATURE_PIPELINE_VERSION,
         "splitFingerprint": fingerprint,
-        "topics": NUM_TOPICS,
+        "topics": num_topics,
         "numWords": num_words,
         "maxTopicsPerWord": max_topics_per_word,
         "featureMode": feature_mode,
         "epochs": epochs,
         "batchSize": batch_size,
         "seed": seed,
-        "groundTruthField": "overall",
+        "groundTruthField": ground_truth_field,
+        "recFeatureAblation": rec_feature_ablation,
+        "splitProfile": split_profile,
+        "standardizeDeepFeatures": standardize_deep_features,
+        "learningRate": learning_rate,
+        "weightDecay": weight_decay,
+        "regressorArchitecture": regressor_architecture,
+        "mlpHiddenDim": mlp_hidden_dim,
+        "mlpDropout": mlp_dropout,
         "splitBeforePreprocessing": True,
         "bertClassBalanced": balance_bert_classes if fine_tune_bert else False,
     }
@@ -442,12 +533,18 @@ def main() -> None:
     resolved_datasets = [dataset_path(value) for value in args.datasets]
 
     print(f"Device: {get_device()}")
-    print(f"k-topic: {NUM_TOPICS}")
+    print(f"k-topic: {args.num_topics}")
     print(
         f"Topic vocabulary: {args.num_words} words/topic, shared by at most "
         f"{args.max_topics_per_word} topics"
     )
     print(f"Feature mode: {args.feature_mode}")
+    print(f"Test ground truth: {args.ground_truth_field}")
+    print(f"Split profile: {args.split_profile}")
+    print(f"PreBERT-Rec features: {args.rec_feature_ablation}")
+    print(f"Standardize deep features: {args.standardize_deep_features}")
+    print(f"Downstream LR / weight decay: {args.learning_rate:g} / {args.weight_decay:g}")
+    print(f"Regressor: {args.regressor_architecture}")
     print(f"BERT encoder: {args.bert_model}")
     print(f"BERT fine-tuning: {args.fine_tune_bert}")
     print(f"BERT class-balanced loss: {args.balance_bert_classes}")
@@ -477,7 +574,10 @@ def main() -> None:
         print("=" * 80)
         set_seed(args.seed)
         _, train_df, valid_df, test_df = create_dataframes(
-            str(json_path), seed=args.seed
+            str(json_path),
+            seed=args.seed,
+            ground_truth_field=args.ground_truth_field,
+            split_profile=args.split_profile,
         )
         fingerprint = split_fingerprint(
             train_df,
@@ -485,6 +585,7 @@ def main() -> None:
             test_df,
             seed=args.seed,
             feature_mode=args.feature_mode,
+            ground_truth_field=args.ground_truth_field,
         )
         # Modes using original review text need separately fine-tuned BERT
         # checkpoints. Keep them isolated from the filtered-text cache.
@@ -527,7 +628,7 @@ def main() -> None:
             "dataset": dataset,
             "datasetPath": str(json_path.resolve()),
             "splitDirectory": str(
-                (json_path.parent / "splits" / json_path.stem).resolve()
+                split_directory(json_path, args.seed, args.split_profile).resolve()
             ),
             "splitFingerprint": fingerprint,
             "featureMode": args.feature_mode,
@@ -541,7 +642,7 @@ def main() -> None:
             "validRows": len(valid_df),
             "testRows": len(test_df),
             "featurePipelineVersion": FEATURE_PIPELINE_VERSION,
-            "groundTruthField": "overall",
+            "groundTruthField": args.ground_truth_field,
             "splitBeforePreprocessing": True,
         }
         write_json_atomic(manifest_path, manifest_value)
@@ -552,6 +653,7 @@ def main() -> None:
                 args.output_dir,
                 dataset,
                 method_slug,
+                num_topics=args.num_topics,
                 num_words=args.num_words,
                 max_topics_per_word=args.max_topics_per_word,
                 feature_mode=args.feature_mode,
@@ -559,12 +661,22 @@ def main() -> None:
                 fine_tune_bert=args.fine_tune_bert,
                 balance_bert_classes=args.balance_bert_classes,
                 seed=args.seed,
+                ground_truth_field=args.ground_truth_field,
+                rec_feature_ablation=args.rec_feature_ablation,
+                split_profile=args.split_profile,
+                standardize_deep_features=args.standardize_deep_features,
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                regressor_architecture=args.regressor_architecture,
+                mlp_hidden_dim=args.mlp_hidden_dim,
+                mlp_dropout=args.mlp_dropout,
             )
             cached_result = None
             if not args.force_results and not cache_reset:
                 cached_result = valid_cached_result(
                     path,
                     fingerprint,
+                    num_topics=args.num_topics,
                     num_words=args.num_words,
                     epochs=args.epochs,
                     batch_size=args.batch_size,
@@ -574,6 +686,15 @@ def main() -> None:
                     bert_model=args.bert_model,
                     fine_tune_bert=args.fine_tune_bert,
                     balance_bert_classes=args.balance_bert_classes,
+                    ground_truth_field=args.ground_truth_field,
+                    rec_feature_ablation=args.rec_feature_ablation,
+                    split_profile=args.split_profile,
+                    standardize_deep_features=args.standardize_deep_features,
+                    learning_rate=args.learning_rate,
+                    weight_decay=args.weight_decay,
+                    regressor_architecture=args.regressor_architecture,
+                    mlp_hidden_dim=args.mlp_hidden_dim,
+                    mlp_dropout=args.mlp_dropout,
                 )
             if cached_result is None:
                 pending.append((method_name, method_slug, path))
@@ -590,12 +711,12 @@ def main() -> None:
 
         for method_name, method_slug, metrics_path in pending:
             print("\n" + "-" * 80)
-            print(f"Cluster: {method_name} | k-topic: {NUM_TOPICS}")
+            print(f"Cluster: {method_name} | k-topic: {args.num_topics}")
             print("-" * 80)
             set_seed(args.seed)
             checkpoint_name = (
-                f"PreBERT_ablation_{dataset}_{method_slug}_k{NUM_TOPICS}_"
-                f"{bert_model_slug(args.bert_model)}"
+                f"PreBERT_ablation_{dataset}_{method_slug}_k{args.num_topics}_"
+                f"{bert_model_slug(args.bert_model)}_{args.rec_feature_ablation}"
             )
             remove_cluster_artifacts(checkpoint_name)
             started_at = time.perf_counter()
@@ -604,7 +725,7 @@ def main() -> None:
                 train_df,
                 valid_df,
                 test_df,
-                NUM_TOPICS,
+                args.num_topics,
                 args.num_words,
                 cluster_method=method_name,
                 bert_cache_dir=cache_dir,
@@ -617,6 +738,9 @@ def main() -> None:
                 bert_model=args.bert_model,
                 bert_fine_tuning=args.fine_tune_bert,
                 balance_bert_classes=args.balance_bert_classes,
+                ground_truth_field=args.ground_truth_field,
+                rec_feature_ablation=args.rec_feature_ablation,
+                standardize_deep_features=args.standardize_deep_features,
             )
             train_loader = csv_to_dataloader(
                 feature_paths["train"], args.batch_size, shuffle=True
@@ -630,11 +754,16 @@ def main() -> None:
             model = train_deepbert(
                 train_loader,
                 valid_loader,
-                NUM_TOPICS,
+                args.num_topics,
                 args.batch_size,
                 args.epochs,
                 checkpoint_name,
                 log_interval=100,
+                learning_rate=args.learning_rate,
+                weight_decay=args.weight_decay,
+                regressor_architecture=args.regressor_architecture,
+                mlp_hidden_dim=args.mlp_hidden_dim,
+                mlp_dropout=args.mlp_dropout,
             )
             classification_metrics = test(
                 model, test_loader, return_details=True
@@ -645,11 +774,11 @@ def main() -> None:
                 "schemaVersion": FEATURE_PIPELINE_VERSION,
                 "dataset": dataset,
                 "splitDirectory": str(
-                    (json_path.parent / "splits" / json_path.stem).resolve()
+                    split_directory(json_path, args.seed, args.split_profile).resolve()
                 ),
                 "method": "PreBERT",
                 "clusterMethod": method_name,
-                "topics": NUM_TOPICS,
+                "topics": args.num_topics,
                 "numWords": args.num_words,
                 "maxTopicsPerWord": args.max_topics_per_word,
                 "featureMode": args.feature_mode,
@@ -661,6 +790,12 @@ def main() -> None:
                 "coarseSentimentMethod": (
                     "fine-tuned-bert" if args.fine_tune_bert else "vader"
                 ),
+                "standardizeDeepFeatures": args.standardize_deep_features,
+                "learningRate": args.learning_rate,
+                "weightDecay": args.weight_decay,
+                "regressorArchitecture": args.regressor_architecture,
+                "mlpHiddenDim": args.mlp_hidden_dim,
+                "mlpDropout": args.mlp_dropout,
                 "epochs": args.epochs,
                 "batchSize": args.batch_size,
                 "seed": args.seed,
@@ -705,7 +840,9 @@ def main() -> None:
                     if args.feature_mode in {"rating-only", "full"}
                     else "overall"
                 ),
-                "groundTruthField": "overall",
+                "groundTruthField": args.ground_truth_field,
+                "recFeatureAblation": args.rec_feature_ablation,
+                "splitProfile": args.split_profile,
                 "splitBeforePreprocessing": True,
                 "featureDiagnostics": feature_paths["featureDiagnostics"],
             }
@@ -726,11 +863,14 @@ def main() -> None:
         )
         args.output_dir.mkdir(parents=True, exist_ok=True)
         summary_path = args.output_dir / (
-            f"clustering_ablation_k{NUM_TOPICS}_words{args.num_words}_"
+            f"clustering_ablation_k{args.num_topics}_words{args.num_words}_"
             f"tpw{args.max_topics_per_word}_{args.feature_mode}"
             f"{encoder_suffix(args.bert_model)}_"
             f"{'pretrained-only_' if not args.fine_tune_bert else ''}"
-            f"seed{args.seed}_v{FEATURE_PIPELINE_VERSION}.csv"
+            f"seed{args.seed}_gt-{args.ground_truth_field}_"
+            f"rec-{args.rec_feature_ablation}_"
+            f"split-{args.split_profile.replace('-', '_')}_"
+            f"v{FEATURE_PIPELINE_VERSION}.csv"
         )
         summary_frame.to_csv(summary_path, index=False)
         print(f"\nAggregate results: {summary_path}")

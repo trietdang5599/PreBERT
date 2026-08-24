@@ -393,9 +393,28 @@ def _select_topic_words(
         try:
             tfidf_matrix = vectorizer.fit_transform(cluster_texts)
         except ValueError as exc:
-            print(f"Error processing cluster {topic_id}: {exc}")
-            ranked_candidates.append([])
-            continue
+            # Small BIRCH clusters can legitimately contain only English stop
+            # words (or one-character product tokens). Retain a lexical
+            # fallback instead of silently producing an empty topic.
+            fallback_vectorizer = TfidfVectorizer(
+                max_features=candidate_count,
+                stop_words=None,
+                token_pattern=r"(?u)\b\w+\b",
+            )
+            try:
+                tfidf_matrix = fallback_vectorizer.fit_transform(cluster_texts)
+                vectorizer = fallback_vectorizer
+                print(
+                    f"Cluster {topic_id}: stop-word-only vocabulary; "
+                    "using lexical fallback."
+                )
+            except ValueError:
+                print(
+                    f"Cluster {topic_id}: no lexical tokens; "
+                    "topic feature remains empty."
+                )
+                ranked_candidates.append([])
+                continue
         if tfidf_matrix.shape[1] == 0:
             print(f"Cluster {topic_id} contains only stop words or empty texts.")
             ranked_candidates.append([])
@@ -429,6 +448,23 @@ def _select_topic_words(
             continue
         topic_to_words[topic_id].append(word)
         word_assignment_counts[word] += 1
+
+    # The sharing cap can starve a cluster whose terms are also common in
+    # earlier clusters. Give such clusters one best lexical term; this is a
+    # local fallback only and preserves the cap for all normal assignments.
+    rescued_topics = []
+    for topic_id, candidates in enumerate(ranked_candidates):
+        if topic_to_words[topic_id] or not candidates:
+            continue
+        word, _ = candidates[0]
+        topic_to_words[topic_id].append(word)
+        word_assignment_counts[word] += 1
+        rescued_topics.append(topic_id)
+    if rescued_topics:
+        print(
+            "Topic vocabulary fallback assigned one shared term to clusters: "
+            + ", ".join(map(str, rescued_topics))
+        )
 
     assignment_count = sum(len(words) for words in topic_to_words)
     unique_count = len(set().union(*(set(words) for words in topic_to_words)))

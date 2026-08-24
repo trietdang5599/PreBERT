@@ -45,7 +45,11 @@ configure_runtime_environment()
 
 DEFAULT_MODEL = DEFAULT_PREPROCESSING_MODEL
 CLAUSE_BOUNDARY = re.compile(
-    r"(?<=[;:])\s+|(?<=[—–])\s*|(?<=,)\s+(?=(?:but|however|yet|while|whereas)\b)",
+    r"(?<=[;:])\s+|(?<=[—–])\s*|"
+    r"(?<=,)\s+(?=(?:but|however|yet|while|whereas|although|though|"
+    r"even though|instead|still|unfortunately|fortunately)\b)|"
+    r"(?<=,)\s+(?=(?:and|so)\s+(?:I|we|it|they|this|that|the\s+"
+    r"(?:product|item|toy|game|song|album))\b)",
     re.IGNORECASE,
 )
 ABBREVIATIONS = {
@@ -55,21 +59,29 @@ ABBREVIATIONS = {
 
 RELEVANCE_INSTRUCTION = """Decide whether the Amazon review segment should be kept for rating prediction.
 
-KEEP every segment that helps explain the rating: sentiment, preference,
+KEEP segments that provide direct evidence for the rating: sentiment, preference,
 recommended age or audience, engagement, repeated use, quality, performance,
 usability, benefits, defects, value, comparisons, or recommendations. Concrete
 evidence such as poor drilling, a broken part, loving a genre, or suitability
 for a wedding is evaluative even without a rating word.
 
-REMOVE only content that cannot help predict the product rating: raw copied
+REMOVE content that does not provide direct evidence for the product rating: raw copied
 ingredient/track/variant/specification lists; free-product or sponsored-review
 disclosures; seller/shipping/packaging/availability-only details; signatures
-and identifiers. Ingredient effects and other reviewer interpretations are
-evaluation and must be kept.
+and identifiers; URLs and promotions for other products; review-writing
+commentary; unrelated personal history; copied manufacturer descriptions; and
+redundant background. Ingredient effects and other reviewer interpretations
+are evaluation and must be kept. Price and purchase details are kept only when
+they support a value judgment such as overpriced, a bargain, or worth the cost.
 
 Judge the TARGET itself. Context only resolves references and must not turn
-metadata into rating evidence. Never remove a target containing any product
-opinion or experience. When uncertain, choose KEEP.
+metadata into rating evidence. Mentioning the product does not by itself make a
+segment evaluative. Generic facts such as available variants, release dates, or
+what comes in the box should be removed. If a sentence mixes background and
+evaluation, keep only its evaluative target clause when segmentation permits.
+Preserve negation, explicit star ratings, update statements, and reasons for a
+positive, negative, or mixed opinion. When uncertain, KEEP only if removing the
+target could change the rating or its explanation; otherwise REMOVE.
 
 Domain-specific examples:
 {few_shots}
@@ -183,12 +195,23 @@ INGREDIENT_VOCABULARY = re.compile(
 )
 EVALUATIVE_SIGNAL = re.compile(
     r"\b(?:love|like|hate|dislike|favorite|best|worst|great|good|bad|beautiful|"
-    r"excellent|amazing|awesome|perfect|poor|poorly|cheap|expensive|overpriced|"
-    r"disappoint\w*|ashamed|recommend\w*|worth|waste|works?|worked|working|"
-    r"broke|broken|durable|sturdy|easy|difficult|hard|soft|smooth|irritat\w*|"
-    r"comfortable|uncomfortable|useful|useless|fun|boring|enjoy\w*|suitable|"
-    r"appropriate|too young|too old|helped?|effective|quality|problem|defect|"
-    r"flaw|smells?|sounds?|tastes?|plays?|replay\w*|purchase again|buy again)\b",
+    r"excellent|amazing|awesome|perfect|poor|cheap|expensive|overpriced|"
+    r"disappoint\w*|recommend\w*|worth|works?|worked|working|durable|sturdy|"
+    r"easy|difficult|hard|soft|smooth|comfortable|uncomfortable|useful|useless|"
+    r"fun|boring|enjoy\w*|effective|quality|smells?|sounds?|tastes?|plays?)\b",
+    re.IGNORECASE,
+)
+STRONG_EVALUATIVE_SIGNAL = re.compile(
+    r"\b(?:hate|dislike|best|worst|poorly|overpriced|disappoint\w*|ashamed|"
+    r"recommend\w*|worth(?:less)?|waste|broke|broken|splinter\w*|irritat\w*|"
+    r"defect\w*|flaw\w*|too young|too old|not (?:work|working|worth)|"
+    r"perfect for|suitable|appropriate|purchase again|buy again|"
+    r"[1-5]\s*(?:/\s*5|stars?))\b",
+    re.IGNORECASE,
+)
+EXPERIENCE_SIGNAL = re.compile(
+    r"\b(?:I|we|my|our|me|us|used?|using|tried|bought|purchased|received|"
+    r"child|kid|son|daughter|husband|wife|friend)\b",
     re.IGNORECASE,
 )
 
@@ -247,8 +270,8 @@ def parse_preprocess_args(argv: Sequence[str] | None = None) -> argparse.Namespa
     parser.add_argument(
         "--minimum-clause-words",
         type=int,
-        default=3,
-        help="Merge shorter clause fragments with a neighbour (default: 3)",
+        default=2,
+        help="Merge shorter clause fragments with a neighbour (default: 2)",
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--review-batch-size", type=int, default=64)
@@ -256,10 +279,10 @@ def parse_preprocess_args(argv: Sequence[str] | None = None) -> argparse.Namespa
     parser.add_argument(
         "--remove-margin",
         type=float,
-        default=0.15,
+        default=0.05,
         help=(
             "Require the REMOVE logit to exceed KEEP by this margin; larger "
-            "values preserve more uncertain segments (default: 0.15)"
+            "values preserve more uncertain segments (default: 0.05)"
         ),
     )
     parser.add_argument(
@@ -438,8 +461,13 @@ def annotate_segments(segments: Sequence[ReviewSegment]) -> list[ReviewSegment]:
             index in catalog_indices or PRODUCT_LIST_INTRO.search(text)
         ):
             decision, reason = False, "raw_product_list"
-        elif EVALUATIVE_SIGNAL.search(text):
-            decision, reason = True, "evaluative_signal"
+        elif STRONG_EVALUATIVE_SIGNAL.search(text):
+            decision, reason = True, "strong_evaluative_signal"
+        elif EVALUATIVE_SIGNAL.search(text) and EXPERIENCE_SIGNAL.search(text):
+            # Broad words such as "good", "like", and "fun" are not enough
+            # by themselves: copied descriptions and variant catalogues often
+            # contain them. Only force KEEP when they are tied to experience.
+            decision, reason = True, "experiential_evaluative_signal"
         else:
             decision, reason = None, None
         annotated.append(
@@ -516,7 +544,7 @@ def segment_review(
     text: Any,
     *,
     mode: str = "hybrid",
-    minimum_clause_words: int = 3,
+    minimum_clause_words: int = 2,
 ) -> list[ReviewSegment]:
     if not isinstance(text, str) or not text.strip():
         return []
@@ -548,7 +576,7 @@ def split_review(
     text: Any,
     *,
     mode: str = "hybrid",
-    minimum_clause_words: int = 3,
+    minimum_clause_words: int = 2,
 ) -> list[str]:
     """Compatibility wrapper returning only segment text."""
     return [
@@ -596,20 +624,15 @@ def adjusted_rating(original: float, item_median: float, polarity: int) -> float
     return float(round((original + item_median) / 2)) if disagrees else original
 
 
-def preprocess_batch(
+def prepare_review_segments(
     rows: Sequence[dict[str, Any]],
-    classifier: ReviewClassifier,
-    medians: dict[str, float],
     *,
     text_field: str,
-    rating_field: str,
-    item_field: str,
-    empty_review_policy: str,
-    adjust_ratings: bool,
-    segmentation_mode: str = "hybrid",
-    minimum_clause_words: int = 3,
-) -> tuple[list[dict[str, Any]], Counter[str]]:
-    split_rows = [
+    segmentation_mode: str,
+    minimum_clause_words: int,
+) -> list[list[ReviewSegment]]:
+    """Step 1: normalize, split, and deterministically annotate each review."""
+    return [
         segment_review(
             row.get(text_field),
             mode=segmentation_mode,
@@ -617,6 +640,13 @@ def preprocess_batch(
         )
         for row in rows
     ]
+
+
+def resolve_relevance_decisions(
+    split_rows: Sequence[Sequence[ReviewSegment]],
+    classifier: ReviewClassifier,
+) -> tuple[list[list[bool]], Counter[str]]:
+    """Step 2: combine deterministic rules with LLM relevance decisions."""
     segments = [segment for parts in split_rows for segment in parts]
     unresolved = [
         segment for segment in segments if segment.forced_relevance is None
@@ -624,21 +654,47 @@ def preprocess_batch(
     model_decisions = classifier.classify_relevance(unresolved) if unresolved else []
     if len(model_decisions) != len(unresolved):
         raise RuntimeError("Relevance classifier returned an unexpected result count")
-    decisions: list[bool] = []
+
+    flat_decisions: list[bool] = []
     model_cursor = 0
     for segment in segments:
         if segment.forced_relevance is None:
-            decisions.append(model_decisions[model_cursor])
+            flat_decisions.append(model_decisions[model_cursor])
             model_cursor += 1
         else:
-            decisions.append(segment.forced_relevance)
+            flat_decisions.append(segment.forced_relevance)
 
+    decisions_by_review: list[list[bool]] = []
     cursor = 0
+    for parts in split_rows:
+        decisions_by_review.append(flat_decisions[cursor : cursor + len(parts)])
+        cursor += len(parts)
+
+    stats: Counter[str] = Counter()
+    stats["segments_forced_keep"] = sum(
+        segment.forced_relevance is True for segment in segments
+    )
+    stats["segments_forced_remove"] = sum(
+        segment.forced_relevance is False for segment in segments
+    )
+    stats["segments_llm_classified"] = len(unresolved)
+    return decisions_by_review, stats
+
+
+def build_filtered_reviews(
+    split_rows: Sequence[Sequence[ReviewSegment]],
+    decisions_by_review: Sequence[Sequence[bool]],
+    *,
+    empty_review_policy: str,
+) -> tuple[list[str], list[int]]:
+    """Step 3: rebuild review text from the segments selected for retention."""
+    if len(split_rows) != len(decisions_by_review):
+        raise RuntimeError("Review decisions do not align with input reviews")
     filtered_texts: list[str] = []
     removed_counts: list[int] = []
-    for parts in split_rows:
-        part_decisions = decisions[cursor : cursor + len(parts)]
-        cursor += len(parts)
+    for parts, part_decisions in zip(split_rows, decisions_by_review):
+        if len(parts) != len(part_decisions):
+            raise RuntimeError("Segment decisions do not align with review segments")
         kept: list[str] = []
         for index, (part, keep) in enumerate(zip(parts, part_decisions)):
             if not keep:
@@ -646,17 +702,20 @@ def preprocess_batch(
             text = part.text
             if index > 0 and not part_decisions[index - 1]:
                 text = re.sub(
-                    r"^(?:but|however|yet|while|whereas)\b\s*[,;:]?\s*",
+                    r"^(?:and|but|however|yet|while|whereas|although|though|"
+                    r"instead|still|unfortunately|fortunately)\b\s*[,;:]?\s*",
                     "",
                     text,
                     flags=re.IGNORECASE,
                 )
+            if index + 1 < len(part_decisions) and not part_decisions[index + 1]:
+                text = re.sub(r"\s*[,;:—–]\s*$", "", text)
             if text:
                 kept.append(text)
         removed_counts.append(len(parts) - len(kept))
         if not kept and parts and empty_review_policy == "keep-original":
-            # Restore only non-prohibited segments if the LLM removed every
-            # useful candidate. Raw lists/disclosures must never be restored.
+            # Never restore deterministic prohibited content. Unknown segments
+            # may be restored to avoid manufacturing an empty training review.
             kept = [
                 part.text
                 for part in parts
@@ -664,7 +723,11 @@ def preprocess_batch(
                 and not prohibited_content_labels(part.text)
             ]
         filtered_texts.append(" ".join(kept))
+    return filtered_texts, removed_counts
 
+
+def validate_filtered_reviews(filtered_texts: Sequence[str]) -> None:
+    """Step 4: enforce preprocessing invariants before rating adjustment."""
     violations = [
         (index, prohibited_content_labels(text))
         for index, text in enumerate(filtered_texts)
@@ -677,34 +740,84 @@ def preprocess_batch(
         )
         raise RuntimeError(f"Prohibited content survived preprocessing: {preview}")
 
-    polarities = (
-        classifier.classify_polarity(filtered_texts) if adjust_ratings else [1] * len(rows)
-    )
+
+def reassess_filtered_review_ratings(
+    rows: Sequence[dict[str, Any]],
+    filtered_texts: Sequence[str],
+    classifier: ReviewClassifier,
+    medians: dict[str, float],
+    *,
+    rating_field: str,
+    item_field: str,
+    adjust_ratings: bool,
+) -> tuple[list[Any], int]:
+    """Step 5: reassess ratings using only the already-filtered review text."""
+    if len(rows) != len(filtered_texts):
+        raise RuntimeError("Filtered reviews do not align with input rows")
+    if not adjust_ratings:
+        return [row.get(rating_field) for row in rows], 0
+    polarities = classifier.classify_polarity(filtered_texts)
     if len(polarities) != len(rows):
         raise RuntimeError("Polarity classifier returned an unexpected result count")
 
+    ratings: list[Any] = []
+    adjusted_count = 0
+    for row, polarity in zip(rows, polarities):
+        original = rating_value(row, rating_field)
+        if original is None:
+            ratings.append(row.get(rating_field))
+            continue
+        item = str(row.get(item_field))
+        new_rating = adjusted_rating(original, medians.get(item, original), polarity)
+        ratings.append(new_rating)
+        adjusted_count += int(new_rating != original)
+    return ratings, adjusted_count
+
+
+def preprocess_batch(
+    rows: Sequence[dict[str, Any]],
+    classifier: ReviewClassifier,
+    medians: dict[str, float],
+    *,
+    text_field: str,
+    rating_field: str,
+    item_field: str,
+    empty_review_policy: str,
+    adjust_ratings: bool,
+    segmentation_mode: str = "hybrid",
+    minimum_clause_words: int = 2,
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    split_rows = prepare_review_segments(
+        rows,
+        text_field=text_field,
+        segmentation_mode=segmentation_mode,
+        minimum_clause_words=minimum_clause_words,
+    )
+    decisions_by_review, stats = resolve_relevance_decisions(split_rows, classifier)
+    filtered_texts, removed_counts = build_filtered_reviews(
+        split_rows,
+        decisions_by_review,
+        empty_review_policy=empty_review_policy,
+    )
+    validate_filtered_reviews(filtered_texts)
+    reassessed_ratings, adjusted_count = reassess_filtered_review_ratings(
+        rows,
+        filtered_texts,
+        classifier,
+        medians,
+        rating_field=rating_field,
+        item_field=item_field,
+        adjust_ratings=adjust_ratings,
+    )
+
     output: list[dict[str, Any]] = []
-    stats: Counter[str] = Counter()
-    stats["segments_forced_keep"] += sum(
-        segment.forced_relevance is True for segment in segments
-    )
-    stats["segments_forced_remove"] += sum(
-        segment.forced_relevance is False for segment in segments
-    )
-    stats["segments_llm_classified"] += len(unresolved)
-    for row, filtered_text, removed, polarity in zip(
-        rows, filtered_texts, removed_counts, polarities
+    stats["ratings_adjusted"] += adjusted_count
+    for row, filtered_text, removed, new_rating in zip(
+        rows, filtered_texts, removed_counts, reassessed_ratings
     ):
         result = dict(row)
         result["filteredReviewText"] = filtered_text
-        original = rating_value(row, rating_field)
-        new_rating = original
-        if adjust_ratings and original is not None:
-            item = str(row.get(item_field))
-            new_rating = adjusted_rating(original, medians.get(item, original), polarity)
-            if new_rating != original:
-                stats["ratings_adjusted"] += 1
-        result["overall_new"] = new_rating if new_rating is not None else row.get(rating_field)
+        result["overall_new"] = new_rating
         output.append(result)
         stats["reviews"] += 1
         stats["segments_removed"] += removed
@@ -1035,18 +1148,22 @@ def preprocess_main(argv: Sequence[str] | None = None) -> None:
     args = parse_preprocess_args(argv)
     rows = read_jsonl(args.input, args.max_samples)
     domain = infer_domain(args.input, args.domain)
-    segment_counts = [
-        len(
-            split_review(
-                row.get(args.text_field),
-                mode=args.segmentation_mode,
-                minimum_clause_words=args.minimum_clause_words,
-            )
+    preview_segments = [
+        segment_review(
+            row.get(args.text_field),
+            mode=args.segmentation_mode,
+            minimum_clause_words=args.minimum_clause_words,
         )
         for row in rows
     ]
+    segment_counts = [len(parts) for parts in preview_segments]
     missing_text = sum(count == 0 for count in segment_counts)
-    classification_count = sum(segment_counts) + (len(rows) if args.adjust_ratings else 0)
+    relevance_classifications = sum(
+        segment.forced_relevance is None
+        for parts in preview_segments
+        for segment in parts
+    )
+    rating_classifications = len(rows) if args.adjust_ratings else 0
     print("LLM review preprocessing")
     print(f"  input: {args.input}")
     print(f"  output: {args.output}")
@@ -1059,7 +1176,12 @@ def preprocess_main(argv: Sequence[str] | None = None) -> None:
     print(f"  rows: {len(rows)}")
     print(f"  rows without text: {missing_text}")
     print(f"  review segments: {sum(segment_counts)}")
-    print(f"  LLM classifications: {classification_count}")
+    print(f"  LLM relevance classifications: {relevance_classifications}")
+    print(f"  LLM rating classifications: {rating_classifications}")
+    print(
+        "  total LLM classifications: "
+        f"{relevance_classifications + rating_classifications}"
+    )
     print(f"  adjust ratings: {args.adjust_ratings}")
     print(f"  requested device: {args.device}")
     if args.dry_run:
@@ -1128,10 +1250,17 @@ DEFAULT_SOURCE_URL = (
 )
 REQUIRED_FIELDS = {"reviewerID", "asin", "overall", "reviewText"}
 
+# Target interaction densities measured from the full datasets in the thesis.
+# The profile sampler scales the corresponding user/item counts to --target-size.
+SAMPLING_PROFILES = {
+    "digital-music": {"reviews_per_user": 1.88, "reviews_per_item": 3.47},
+    "toys-games": {"reviews_per_user": 1.95, "reviews_per_item": 13.13},
+}
+
 
 def parse_build_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Build an exact dense k-core subset from an Amazon review archive."
+        description="Build a fixed-size subset from an Amazon review archive."
     )
     parser.add_argument(
         "--raw-cache",
@@ -1146,12 +1275,21 @@ def parse_build_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-url", default=DEFAULT_SOURCE_URL)
     parser.add_argument("--target-size", type=int, default=10_000)
     parser.add_argument("--k-core", type=int, default=5)
+    parser.add_argument(
+        "--sampling-profile",
+        choices=("dense", *SAMPLING_PROFILES),
+        default="dense",
+        help=(
+            "Subset strategy: dense preserves the legacy k-core behavior; "
+            "domain profiles target the full dataset's interaction density."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
     if args.target_size <= 0 or args.k_core <= 0:
         parser.error("--target-size and --k-core must be positive")
-    if args.target_size < args.k_core * args.k_core:
+    if args.sampling_profile == "dense" and args.target_size < args.k_core * args.k_core:
         parser.error("--target-size is too small for the requested k-core")
     return args
 
@@ -1387,6 +1525,108 @@ def select_dense_subset(
     )
 
 
+def profile_target_counts(profile: str, target_size: int) -> tuple[int, int]:
+    """Return the user/item counts implied by a full-dataset profile."""
+    try:
+        values = SAMPLING_PROFILES[profile]
+    except KeyError as exc:
+        raise ValueError(f"Unknown sampling profile: {profile}") from exc
+    users = round(target_size / values["reviews_per_user"])
+    items = round(target_size / values["reviews_per_item"])
+    if min(users, items) <= 0:
+        raise ValueError("Profile target counts must be positive")
+    return users, items
+
+
+def _top_entities(frame: pd.DataFrame, column: str, count: int) -> set[str]:
+    values = frame[column].value_counts(sort=True)
+    if len(values) < count:
+        raise RuntimeError(
+            f"Only {len(values):,} distinct {column} values are available; "
+            f"profile requires {count:,}"
+        )
+    return set(values.head(count).index.astype(str))
+
+
+def _profile_candidate(
+    reviews: pd.DataFrame, target_users: int, target_items: int
+) -> tuple[pd.DataFrame, set[str], set[str]]:
+    """Construct an interaction pool with the requested entity cardinalities."""
+    # Alternate user and item selection. Re-ranking after every restriction
+    # avoids requesting entities that have no interactions in the final pool.
+    items = _top_entities(reviews, "asin", target_items)
+    users: set[str] = set()
+    candidate = reviews
+    for _ in range(8):
+        candidate = reviews.loc[reviews["asin"].isin(items)]
+        users = _top_entities(candidate, "reviewerID", target_users)
+        candidate = reviews.loc[reviews["reviewerID"].isin(users)]
+        items = _top_entities(candidate, "asin", target_items)
+
+    candidate = reviews.loc[
+        reviews["reviewerID"].isin(users) & reviews["asin"].isin(items)
+    ].copy()
+    active_users = set(candidate["reviewerID"].astype(str).unique())
+    active_items = set(candidate["asin"].astype(str).unique())
+    if len(active_users) != target_users or len(active_items) != target_items:
+        raise RuntimeError(
+            "Could not form a profile cohort with the requested user/item "
+            "counts. Try a larger source dataset or a smaller --target-size."
+        )
+    return candidate, active_users, active_items
+
+
+def _coverage_sample(
+    candidate: pd.DataFrame,
+    users: set[str],
+    items: set[str],
+    target_size: int,
+    seed: int,
+) -> pd.DataFrame:
+    """Sample exactly target_size interactions while retaining every entity."""
+    if len(candidate) < target_size:
+        raise RuntimeError(
+            f"Profile candidate has {len(candidate):,} reviews; need {target_size:,}"
+        )
+    rng = np.random.default_rng(seed)
+    shuffled = candidate.iloc[rng.permutation(len(candidate))].copy()
+    selected_indices: set[Any] = set()
+
+    # First cover all lower-cardinality entities, then cover entities not yet
+    # represented. Selecting randomly among each entity's candidate edges keeps
+    # the procedure deterministic but avoids input-order bias.
+    for column, entities in (("asin", items), ("reviewerID", users)):
+        for entity in sorted(entities):
+            matching = shuffled.index[shuffled[column].astype(str).eq(entity)]
+            if not any(index in selected_indices for index in matching):
+                selected_indices.add(matching[0])
+
+    if len(selected_indices) > target_size:
+        raise RuntimeError(
+            "Profile requires more entity-coverage edges than --target-size"
+        )
+    remaining = [index for index in shuffled.index if index not in selected_indices]
+    selected_indices.update(remaining[: target_size - len(selected_indices)])
+    result = shuffled.loc[
+        [index for index in shuffled.index if index in selected_indices]
+    ].copy()
+    return result.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+
+def select_profile_subset(
+    reviews: pd.DataFrame, target_size: int, profile: str, seed: int
+) -> pd.DataFrame:
+    """Create a fixed-size subset matching a domain's user/item densities."""
+    target_users, target_items = profile_target_counts(profile, target_size)
+    candidate, users, items = _profile_candidate(reviews, target_users, target_items)
+    subset = _coverage_sample(candidate, users, items, target_size, seed)
+    actual_users = subset["reviewerID"].nunique()
+    actual_items = subset["asin"].nunique()
+    if actual_users != target_users or actual_items != target_items:
+        raise AssertionError("Profile sampler did not retain every selected entity")
+    return subset
+
+
 def dataset_statistics(frame: pd.DataFrame) -> dict[str, Any]:
     user_counts = frame["reviewerID"].value_counts()
     item_counts = frame["asin"].value_counts()
@@ -1395,6 +1635,8 @@ def dataset_statistics(frame: pd.DataFrame) -> dict[str, Any]:
         "users": int(len(user_counts)),
         "items": int(len(item_counts)),
         "density": float(len(frame) / (len(user_counts) * len(item_counts))),
+        "mean_reviews_per_user": float(user_counts.mean()),
+        "mean_reviews_per_item": float(item_counts.mean()),
         "min_reviews_per_user": int(user_counts.min()),
         "median_reviews_per_user": float(user_counts.median()),
         "min_reviews_per_item": int(item_counts.min()),
@@ -1460,8 +1702,35 @@ def write_sampling_report(
             "output": str(args.output),
             "seed": args.seed,
             "k_core": args.k_core,
+            "sampling_profile": args.sampling_profile,
         }
     )
+    if args.sampling_profile != "dense":
+        target_users, target_items = profile_target_counts(
+            args.sampling_profile, args.target_size
+        )
+        report["profile_targets"] = {
+            "users": target_users,
+            "items": target_items,
+            "reviews_per_user": SAMPLING_PROFILES[args.sampling_profile][
+                "reviews_per_user"
+            ],
+            "reviews_per_item": SAMPLING_PROFILES[args.sampling_profile][
+                "reviews_per_item"
+            ],
+        }
+        report["profile_deviation"] = {
+            "users": int(report["users"] - target_users),
+            "items": int(report["items"] - target_items),
+            "reviews_per_user": float(
+                report["mean_reviews_per_user"]
+                - SAMPLING_PROFILES[args.sampling_profile]["reviews_per_user"]
+            ),
+            "reviews_per_item": float(
+                report["mean_reviews_per_item"]
+                - SAMPLING_PROFILES[args.sampling_profile]["reviews_per_item"]
+            ),
+        }
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -1477,7 +1746,14 @@ def build_dataset_main(argv: Sequence[str] | None = None) -> None:
     # failing with argparse exit code 2.
     if args.output.is_file() and not args.overwrite:
         subset = load_existing_subset(args.output)
-        validate_subset(subset, args.target_size, args.k_core)
+        if args.sampling_profile == "dense":
+            validate_subset(subset, args.target_size, args.k_core)
+        else:
+            target_users, target_items = profile_target_counts(
+                args.sampling_profile, args.target_size
+            )
+            if subset["reviewerID"].nunique() != target_users or subset["asin"].nunique() != target_items:
+                raise ValueError("Existing subset does not match the sampling profile")
         report = write_sampling_report(subset, args, report_path)
         print(f"Using existing valid subset: {args.output}")
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -1486,8 +1762,13 @@ def build_dataset_main(argv: Sequence[str] | None = None) -> None:
 
     download_file(args.source_url, args.raw_cache)
     reviews = load_reviews(args.raw_cache)
-    subset = select_dense_subset(reviews, args.target_size, args.k_core, args.seed)
-    validate_subset(subset, args.target_size, args.k_core)
+    if args.sampling_profile == "dense":
+        subset = select_dense_subset(reviews, args.target_size, args.k_core, args.seed)
+        validate_subset(subset, args.target_size, args.k_core)
+    else:
+        subset = select_profile_subset(
+            reviews, args.target_size, args.sampling_profile, args.seed
+        )
     write_jsonl_atomic(args.output, subset.to_dict(orient="records"))
 
     report = write_sampling_report(subset, args, report_path)
@@ -1497,6 +1778,19 @@ def build_dataset_main(argv: Sequence[str] | None = None) -> None:
 
 
 SPLIT_MAPPING_FIELDS = ("reviewerID", "asin", "unixReviewTime", "overall")
+SPLIT_PROFILES = {
+    "8-1-1": (0.8, 0.1),
+    "7-1-2": (0.7, 0.1),
+}
+
+
+def split_output_directory(dataset_path: Path, seed: int, profile: str) -> Path:
+    """Return the stable physical location for a named split profile."""
+    root = Path("data/splits") / dataset_path.stem
+    # Retain the existing 8/1/1 layout for compatibility with prior results.
+    if profile == "8-1-1":
+        return root / f"seed_{seed}"
+    return root / f"ratio_{profile.replace('-', '_')}" / f"seed_{seed}"
 
 
 def _split_mapping_key(row: dict[str, Any]) -> tuple[Any, ...]:
@@ -1567,6 +1861,7 @@ def split_preprocessed_rows(
     seed: int = 42,
     train_ratio: float = 0.8,
     validation_ratio: float = 0.1,
+    test_rating_field: str = "overall",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """Split original rows first, then attach already-preprocessed records."""
     processed_map = _occurrence_map(processed_rows)
@@ -1611,7 +1906,7 @@ def split_preprocessed_rows(
         for source, processed in split:
             record = dict(processed)
             record["overall"] = source["overall"]
-            if split_index == 2:
+            if split_index == 2 and test_rating_field == "overall":
                 record.pop("overall_new", None)
             records.append(record)
         outputs.append(records)
@@ -1626,10 +1921,26 @@ def parse_split_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", type=Path, help="Original pre-preprocessing JSONL")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--split-profile",
+        choices=tuple(SPLIT_PROFILES),
+        default="8-1-1",
+        help="Named split ratio: 8-1-1 (80/10/10) or 7-1-2 (70/10/20).",
+    )
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--validation-ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--test-rating-field",
+        choices=("overall", "overall_new"),
+        default="overall",
+        help=(
+            "Rating field retained for test evaluation. Default removes "
+            "overall_new so the original overall is the only test label."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args(argv)
+    args.train_ratio, args.validation_ratio = SPLIT_PROFILES[args.split_profile]
     test_ratio = 1.0 - args.train_ratio - args.validation_ratio
     if min(args.train_ratio, args.validation_ratio, test_ratio) <= 0:
         parser.error("train, validation, and test ratios must all be positive")
@@ -1650,8 +1961,11 @@ def split_main(argv: Sequence[str] | None = None) -> None:
         seed=args.seed,
         train_ratio=args.train_ratio,
         validation_ratio=args.validation_ratio,
+        test_rating_field=args.test_rating_field,
     )
-    output_dir = args.output_dir or Path("data/splits") / args.input.stem
+    output_dir = args.output_dir or split_output_directory(
+        args.input, args.seed, args.split_profile
+    )
     paths = {
         "train": output_dir / "train.json",
         "validation": output_dir / "val.json",
@@ -1669,7 +1983,8 @@ def split_main(argv: Sequence[str] | None = None) -> None:
     print(f"Split source: {source_path}")
     print(
         f"Saved train={len(train_rows)}, validation={len(validation_rows)}, "
-        f"test={len(test_rows)} to {output_dir}"
+        f"test={len(test_rows)} to {output_dir} "
+        f"(profile: {args.split_profile}; test rating field: {args.test_rating_field})"
     )
 
 

@@ -6,6 +6,7 @@ import copy
 import numpy as np
 import pandas as pd
 import tqdm
+from sklearn.preprocessing import StandardScaler
 from helper.general_functions import create_and_write_csv, word_segment
 from combine_review_rating import Calculate_Deep
 from sklearn.metrics import (
@@ -87,6 +88,30 @@ class FullyConnectedModel(nn.Module):
         prediction += self.global_bias + item_bias + user_bias
         return prediction
 
+
+class FusionMLPModel(nn.Module):
+    """Learn nonlinear fusion from user, item, and Hadamard features."""
+
+    def __init__(self, feature_dim, hidden_dim=64, dropout=0.1, global_mean=0.0):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.network = nn.Sequential(
+            nn.LayerNorm(feature_dim * 3),
+            nn.Linear(feature_dim * 3, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.global_bias = nn.Parameter(torch.tensor([global_mean], dtype=torch.float32))
+
+    def forward(self, user_features, item_features, item_bias, user_bias):
+        fused = torch.cat(
+            (user_features, item_features, user_features * item_features), dim=1
+        ).to(dtype=torch.float32)
+        prediction = self.network(fused).squeeze(-1)
+        prediction += self.global_bias + item_bias + user_bias
+        return prediction
+
     
 def train_deepbert(
     train_data_loader,
@@ -97,6 +122,10 @@ def train_deepbert(
     method_name,
     log_interval=100,
     learning_rate=0.01,
+    weight_decay=1e-4,
+    regressor_architecture="linear",
+    mlp_hidden_dim=64,
+    mlp_dropout=0.1,
 ):
     print("=================== Training DeepCGSR model ============================")
     device = get_device()
@@ -105,16 +134,29 @@ def train_deepbert(
     if feature_dim == 0:
         raise ValueError("Udeep/Ideep feature vectors are empty")
     global_mean = float(train_data_loader.dataset.tensors[2].mean())
-    model = FullyConnectedModel(
-        input_dim=feature_dim,
-        output_dim=1,
-        global_mean=global_mean,
-    ).to(device)
+    if regressor_architecture == "linear":
+        model = FullyConnectedModel(
+            input_dim=feature_dim,
+            output_dim=1,
+            global_mean=global_mean,
+        )
+    elif regressor_architecture == "fusion-mlp":
+        model = FusionMLPModel(
+            feature_dim=feature_dim,
+            hidden_dim=mlp_hidden_dim,
+            dropout=mlp_dropout,
+            global_mean=global_mean,
+        )
+    else:
+        raise ValueError(
+            "regressor_architecture must be 'linear' or 'fusion-mlp'"
+        )
+    model = model.to(device)
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(
         model.parameters(),
         lr=learning_rate,
-        weight_decay=1e-4,
+        weight_decay=weight_decay,
     )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -377,6 +419,9 @@ def _create_deep_embeddings(
     *,
     entity,
     num_factors,
+    include_review_features=True,
+    include_rating_features=True,
+    feature_scaler=None,
 ):
     normalized_features = {
         str(key): np.asarray(value, dtype=np.float32)
@@ -392,9 +437,65 @@ def _create_deep_embeddings(
         else:
             rating_vector = svd.get_item_embedding(identifier)
             fm_name = f"itemID_{identifier}"
+        if not include_review_features:
+            review_vector = np.zeros(num_factors, dtype=np.float32)
+        if not include_rating_features:
+            rating_vector = np.zeros(num_factors, dtype=np.float32)
         combined = np.concatenate((review_vector, rating_vector)).astype(np.float32)
-        result[identifier] = Calculate_Deep(combined, fm.get_embedding(fm_name))
+        if feature_scaler is not None:
+            combined = feature_scaler.transform(combined.reshape(1, -1))[0].astype(
+                np.float32
+            )
+        fusion_vector = (
+            fm.get_embedding(fm_name)
+            if include_rating_features
+            else np.ones(num_factors * 2, dtype=np.float32)
+        )
+        result[identifier] = Calculate_Deep(combined, fusion_vector)
     return result
+
+
+def _fit_deep_feature_scaler(
+    train_users,
+    train_items,
+    reviewer_features,
+    item_features,
+    svd,
+    *,
+    num_factors,
+    include_review_features=True,
+    include_rating_features=True,
+):
+    """Fit feature-wise scaling using train entities only.
+
+    This scaler is deliberately fitted before FM fusion.  It keeps review and
+    SVD blocks on comparable scales while avoiding validation/test leakage.
+    """
+    rows = []
+    for identifiers, features, entity in (
+        (train_users, reviewer_features, "reviewer"),
+        (train_items, item_features, "item"),
+    ):
+        normalized = {
+            str(key): np.asarray(value, dtype=np.float32)
+            for key, value in features.items()
+        }
+        fallback = _mean_feature(normalized, num_factors)
+        for identifier in sorted(map(str, identifiers)):
+            review_vector = normalized.get(identifier, fallback)
+            rating_vector = (
+                svd.get_user_embedding(identifier)
+                if entity == "reviewer"
+                else svd.get_item_embedding(identifier)
+            )
+            if not include_review_features:
+                review_vector = np.zeros(num_factors, dtype=np.float32)
+            if not include_rating_features:
+                rating_vector = np.zeros(num_factors, dtype=np.float32)
+            rows.append(np.concatenate((review_vector, rating_vector)))
+    if not rows:
+        raise ValueError("Cannot fit deep feature scaler without train entities")
+    return StandardScaler().fit(np.vstack(rows))
 
 
 def _build_final_feature_frame(
@@ -405,6 +506,7 @@ def _build_final_feature_frame(
     item_biases,
     reviewer_codes,
     item_codes,
+    include_rating_features=True,
 ):
     interactions = _interaction_frame(dataset_df)
     users = interactions["reviewerID"].tolist()
@@ -416,25 +518,39 @@ def _build_final_feature_frame(
             "overall": interactions["overall"].to_numpy(dtype=np.float32),
             "Udeep": [user_embeddings[value].tolist() for value in users],
             "Ideep": [item_embeddings[value].tolist() for value in items],
-            "item_bias": [float(item_biases.get(value, 0.0)) for value in items],
-            "user_bias": [float(user_biases.get(value, 0.0)) for value in users],
+            "item_bias": [
+                float(item_biases.get(value, 0.0)) if include_rating_features else 0.0
+                for value in items
+            ],
+            "user_bias": [
+                float(user_biases.get(value, 0.0)) if include_rating_features else 0.0
+                for value in users
+            ],
         }
     )
 
 
-def apply_preprocessing_mode(train_df, valid_df, test_df, feature_mode):
-    """Select model inputs while keeping the test label immutable."""
+def apply_preprocessing_mode(
+    train_df, valid_df, test_df, feature_mode, ground_truth_field="overall"
+):
+    """Select model inputs and the configured immutable test label."""
     if feature_mode not in {"full", "review-only", "rating-only", "raw"}:
         raise ValueError(f"Unsupported preprocessing mode: {feature_mode}")
     uses_filtered_review = feature_mode in {"review-only", "full"}
     uses_adjusted_training_rating = feature_mode in {"rating-only", "full"}
+    if ground_truth_field not in {"overall", "overall_new"}:
+        raise ValueError("ground_truth_field must be 'overall' or 'overall_new'")
 
     def select_fields(frame, *, is_test=False):
         selected_frame = frame.copy()
         if not uses_filtered_review:
             selected_frame["filteredReviewText"] = selected_frame["reviewText"]
         if is_test:
-            selected_frame["modelRating"] = selected_frame["overall"]
+            if ground_truth_field not in selected_frame:
+                raise ValueError(
+                    f"test split is missing configured ground truth: {ground_truth_field}"
+                )
+            selected_frame["modelRating"] = selected_frame[ground_truth_field]
         elif uses_adjusted_training_rating:
             if "overall_new" not in selected_frame:
                 raise ValueError("train/validation split is missing overall_new")
@@ -469,13 +585,23 @@ def prepare_deepbert_splits(
     bert_model="answerdotai/ModernBERT-base",
     bert_fine_tuning=True,
     balance_bert_classes=True,
+    ground_truth_field="overall",
+    rec_feature_ablation="full",
+    standardize_deep_features=False,
 ):
-    """Fit on fixed train/validation splits and evaluate original test ratings."""
+    """Fit on fixed train/validation splits and evaluate the selected test rating."""
     if feature_mode not in {"full", "review-only", "rating-only", "raw"}:
         raise ValueError(
             "feature_mode must be one of: 'full', 'review-only', "
             "'rating-only', 'raw'"
         )
+    if rec_feature_ablation not in {"full", "without-review", "without-rating"}:
+        raise ValueError(
+            "rec_feature_ablation must be one of: 'full', 'without-review', "
+            "'without-rating'"
+        )
+    include_review_features = rec_feature_ablation != "without-review"
+    include_rating_features = rec_feature_ablation != "without-rating"
     (
         _,
         _,
@@ -491,7 +617,11 @@ def prepare_deepbert_splits(
     ) = setup_path()
 
     train_df, valid_df, test_df = apply_preprocessing_mode(
-        train_df, valid_df, test_df, feature_mode
+        train_df,
+        valid_df,
+        test_df,
+        feature_mode,
+        ground_truth_field=ground_truth_field,
     )
 
     train_interactions = _interaction_frame(train_df)
@@ -555,6 +685,22 @@ def prepare_deepbert_splits(
         sparse_matrix_path + "train.npz",
         validation_data=valid_interactions,
     )
+    feature_scaler = None
+    if standardize_deep_features:
+        feature_scaler = _fit_deep_feature_scaler(
+            train_interactions["reviewerID"].unique(),
+            train_interactions["itemID"].unique(),
+            reviewer_features,
+            item_features,
+            svd,
+            num_factors=num_factors,
+            include_review_features=include_review_features,
+            include_rating_features=include_rating_features,
+        )
+        print(
+            "Standardized deep features using train entities only "
+            f"({feature_scaler.n_samples_seen_} entities)."
+        )
     user_embeddings = _create_deep_embeddings(
         all_users,
         reviewer_features,
@@ -562,6 +708,9 @@ def prepare_deepbert_splits(
         fm,
         entity="reviewer",
         num_factors=num_factors,
+        include_review_features=include_review_features,
+        include_rating_features=include_rating_features,
+        feature_scaler=feature_scaler,
     )
     item_embeddings = _create_deep_embeddings(
         all_items,
@@ -570,6 +719,9 @@ def prepare_deepbert_splits(
         fm,
         entity="item",
         num_factors=num_factors,
+        include_review_features=include_review_features,
+        include_rating_features=include_rating_features,
+        feature_scaler=feature_scaler,
     )
     _, user_biases, item_biases = _fit_regularized_biases(train_interactions)
     create_and_write_csv("u_deep_train", user_embeddings)
@@ -590,6 +742,7 @@ def prepare_deepbert_splits(
             item_biases,
             reviewer_codes,
             item_codes,
+            include_rating_features=include_rating_features,
         )
         output_path = f"{final_data_path}DeepBERT_{split}.csv"
         output.to_csv(output_path, index=False)

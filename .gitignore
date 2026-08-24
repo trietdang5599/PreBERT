@@ -26,3 +26,4 @@ feature/interactions_train.csv
 feature/item_feature_train.csv
 feature/reviewer_feature_train.csv
 feature/u_deep_train.csv
+tests/

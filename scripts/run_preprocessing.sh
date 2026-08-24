@@ -5,8 +5,8 @@ set -euo pipefail
 # Full preprocessing protocol used by the thesis.
 SOURCES=(
   "data/backup/Small_All_Beauty_5.json"
-  "data/backup/Small_Digital_Music_5.json"
-  "data/Small_Toys_and_Games_5_dense10k.json"
+  "data/Small_Digital_Music_5_profile10k.json"
+  "data/Small_Toys_and_Games_5_profile10k.json"
 )
 PROCESSED_OUTPUTS=(
   "data/Small_All_Beauty_5_llama_filtered.json"
@@ -15,14 +15,25 @@ PROCESSED_OUTPUTS=(
 )
 DOMAINS=(all_beauty digital_music toys_games)
 
-RUN_DENSE_BUILD=true
-DENSE_SOURCE_URL="https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Toys_and_Games_5.json.gz"
-DENSE_RAW_CACHE="data/raw/reviews_Toys_and_Games_5.json.gz"
-DENSE_OUTPUT="data/Small_Toys_and_Games_5_dense10k.json"
-DENSE_TARGET_SIZE=10000
-DENSE_K_CORE=5
-DENSE_SEED=2026
-REBUILD_DENSE=false
+# Profile-aware 10K subsets preserve the full domains' interaction density
+# much more closely than the former 5-core sampling strategy.
+RUN_PROFILE_BUILDS=true
+PROFILE_SOURCE_URLS=(
+  "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Digital_Music_5.json.gz"
+  "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Toys_and_Games_5.json.gz"
+)
+PROFILE_RAW_CACHES=(
+  "data/raw/reviews_Digital_Music_5.json.gz"
+  "data/raw/reviews_Toys_and_Games_5.json.gz"
+)
+PROFILE_OUTPUTS=(
+  "data/Small_Digital_Music_5_profile10k.json"
+  "data/Small_Toys_and_Games_5_profile10k.json"
+)
+PROFILE_NAMES=(digital-music toys-games)
+PROFILE_TARGET_SIZE=10000
+PROFILE_SEED=2026
+REBUILD_PROFILE_SUBSETS=false
 
 RUN_LLM_PREPROCESSING=true
 PREPROCESSING_MODEL="meta-llama/Llama-3.2-3B-Instruct"
@@ -31,12 +42,12 @@ TEXT_FIELD="reviewText"
 RATING_FIELD="overall"
 ITEM_FIELD="asin"
 SEGMENTATION_MODE="hybrid"           # hybrid | sentence
-MINIMUM_CLAUSE_WORDS=3
+MINIMUM_CLAUSE_WORDS=2               # Finer clause-level filtering.
 BATCH_SIZE=16
 REVIEW_BATCH_SIZE=128
 MAX_LENGTH=512
 MAX_SAMPLES=""                       # Empty means all rows.
-REMOVE_MARGIN=0.15                   # Deterministic KEEP rules protect rating evidence.
+REMOVE_MARGIN=0.05                   # Balanced-strict; lower values remove more uncertain text.
 EMPTY_REVIEW_POLICY="keep-original"
 ADJUST_RATINGS=true
 TRUST_REMOTE_CODE=false
@@ -51,12 +62,19 @@ REUSE_EXISTING_PROCESSED=false
 OVERWRITE_PROCESSED=true
 
 RUN_SPLIT=true
-SPLIT_SEED=42
-TRAIN_RATIO=0.8
-VALIDATION_RATIO=0.1
+SPLIT_SEEDS=(41 42)
+SPLIT_PROFILE="7-1-2"               # 8-1-1 | 7-1-2
+TEST_RATING_FIELD="overall_new"      # overall | overall_new
 OVERWRITE_SPLITS=true
 DRY_RUN=false
 # ======================================================================
+
+# Make a command-line dry run cover both subset construction and the later
+# preprocessing/splitting commands.
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY_RUN=true
+  shift
+fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
@@ -82,18 +100,24 @@ run_command() {
   [[ "${DRY_RUN}" == true ]] || "$@"
 }
 
-if [[ "${RUN_DENSE_BUILD}" == true ]]; then
-  COMMAND=(
-    "${PYTHON}" preprocessing_reviews.py build-dataset
-    --source-url "${DENSE_SOURCE_URL}"
-    --raw-cache "${DENSE_RAW_CACHE}"
-    --output "${DENSE_OUTPUT}"
-    --target-size "${DENSE_TARGET_SIZE}"
-    --k-core "${DENSE_K_CORE}"
-    --seed "${DENSE_SEED}"
-  )
-  [[ "${REBUILD_DENSE}" == true ]] && COMMAND+=(--overwrite)
-  run_command "${COMMAND[@]}"
+if [[ "${RUN_PROFILE_BUILDS}" == true ]]; then
+  if [[ ${#PROFILE_SOURCE_URLS[@]} -ne ${#PROFILE_RAW_CACHES[@]} || ${#PROFILE_SOURCE_URLS[@]} -ne ${#PROFILE_OUTPUTS[@]} || ${#PROFILE_SOURCE_URLS[@]} -ne ${#PROFILE_NAMES[@]} ]]; then
+    echo "PROFILE_SOURCE_URLS, PROFILE_RAW_CACHES, PROFILE_OUTPUTS, and PROFILE_NAMES must have the same length" >&2
+    exit 2
+  fi
+  for index in "${!PROFILE_NAMES[@]}"; do
+    COMMAND=(
+      "${PYTHON}" preprocessing_reviews.py build-dataset
+      --source-url "${PROFILE_SOURCE_URLS[index]}"
+      --raw-cache "${PROFILE_RAW_CACHES[index]}"
+      --output "${PROFILE_OUTPUTS[index]}"
+      --target-size "${PROFILE_TARGET_SIZE}"
+      --sampling-profile "${PROFILE_NAMES[index]}"
+      --seed "${PROFILE_SEED}"
+    )
+    [[ "${REBUILD_PROFILE_SUBSETS}" == true ]] && COMMAND+=(--overwrite)
+    run_command "${COMMAND[@]}"
+  done
 fi
 
 for index in "${!SOURCES[@]}"; do
@@ -138,14 +162,16 @@ for index in "${!SOURCES[@]}"; do
   fi
 
   if [[ "${RUN_SPLIT}" == true ]]; then
-    COMMAND=(
-      "${PYTHON}" preprocessing_reviews.py split "${processed_path}"
-      --source "${source_path}"
-      --seed "${SPLIT_SEED}"
-      --train-ratio "${TRAIN_RATIO}"
-      --validation-ratio "${VALIDATION_RATIO}"
-    )
-    [[ "${OVERWRITE_SPLITS}" == true ]] && COMMAND+=(--overwrite)
-    run_command "${COMMAND[@]}"
+    for split_seed in "${SPLIT_SEEDS[@]}"; do
+      COMMAND=(
+        "${PYTHON}" preprocessing_reviews.py split "${processed_path}"
+        --source "${source_path}"
+        --seed "${split_seed}"
+        --split-profile "${SPLIT_PROFILE}"
+        --test-rating-field "${TEST_RATING_FIELD}"
+      )
+      [[ "${OVERWRITE_SPLITS}" == true ]] && COMMAND+=(--overwrite)
+      run_command "${COMMAND[@]}"
+    done
   fi
 done

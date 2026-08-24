@@ -21,6 +21,18 @@ class RejectUnknownClassifier:
         return [1] * len(texts)
 
 
+class RecordingClassifier:
+    def __init__(self):
+        self.polarity_inputs = []
+
+    def classify_relevance(self, segments):
+        return [False] * len(segments)
+
+    def classify_polarity(self, texts):
+        self.polarity_inputs = list(texts)
+        return [0] * len(texts)
+
+
 def preprocess(text: str, domain_id: str = "item-1") -> str:
     rows = [{"asin": domain_id, "overall": 5, "reviewText": text}]
     output, _stats = preprocess_batch(
@@ -73,6 +85,48 @@ class PreprocessingSafetyTest(unittest.TestCase):
     def test_evaluative_ingredient_comment_is_not_a_raw_list(self):
         text = "The fragrance irritated my skin, but salicylic acid helped my acne."
         self.assertEqual([], prohibited_content_labels(text))
+
+    def test_generic_marketing_language_is_not_forced_keep(self):
+        segments = segment_review("This product is available in many fun colors.")
+        self.assertEqual(1, len(segments))
+        self.assertIsNone(segments[0].forced_relevance)
+
+    def test_hybrid_segmentation_splits_coordinated_experience_clause(self):
+        segments = segment_review(
+            "The box lists many colors, and I found the controls difficult."
+        )
+        self.assertEqual(
+            ["The box lists many colors,", "and I found the controls difficult."],
+            [segment.text for segment in segments],
+        )
+
+    def test_rating_adjustment_receives_filtered_review_text(self):
+        classifier = RecordingClassifier()
+        rows = [
+            {
+                "asin": "item-1",
+                "overall": 5,
+                "reviewText": (
+                    "I usually write long reviews, but it broke after two uses."
+                ),
+            }
+        ]
+        output, stats = preprocess_batch(
+            rows,
+            classifier,
+            {"item-1": 1.0},
+            text_field="reviewText",
+            rating_field="overall",
+            item_field="asin",
+            empty_review_policy="keep-original",
+            adjust_ratings=True,
+        )
+        self.assertEqual("it broke after two uses.", output[0]["filteredReviewText"])
+        self.assertEqual(
+            [output[0]["filteredReviewText"]], classifier.polarity_inputs
+        )
+        self.assertEqual(3.0, output[0]["overall_new"])
+        self.assertEqual(1, stats["ratings_adjusted"])
 
     def test_audit_contains_all_heavy_removals_and_fifty_random_rows(self):
         rows = [

@@ -7,6 +7,15 @@ from pathlib import Path
 
 import pandas as pd
 
+
+def split_directory(dataset_path: Path, seed: int, split_profile: str) -> Path:
+    if split_profile not in {"8-1-1", "7-1-2"}:
+        raise ValueError("split_profile must be '8-1-1' or '7-1-2'")
+    root = dataset_path.parent / "splits" / dataset_path.stem
+    if split_profile == "8-1-1":
+        return root / f"seed_{seed}"
+    return root / f"ratio_{split_profile.replace('-', '_')}" / f"seed_{seed}"
+
 def _read_jsonl_records(path: Path) -> list[dict]:
     records = []
     with path.open(encoding="utf-8") as handle:
@@ -29,17 +38,20 @@ def create_dataframes(
     valid_ratio: float = 0.1,
     test_ratio: float = 0.1,
     seed: int = 42,
+    ground_truth_field: str = "overall",
+    split_profile: str = "8-1-1",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load the immutable pre-preprocessing train/validation/test assignment.
 
-    ``train_ratio``, ``valid_ratio``, ``test_ratio``, and ``seed`` remain in
-    the signature for API compatibility. Splitting is owned exclusively by
-    ``preprocessing_reviews.py split`` and is never repeated during an
-    experiment.
+    Splitting is owned exclusively by ``preprocessing_reviews.py split`` and
+    is never repeated during an experiment. ``seed`` selects the corresponding
+    physical split directory.
     """
-    del train_ratio, valid_ratio, test_ratio, seed
+    del train_ratio, valid_ratio, test_ratio
+    if ground_truth_field not in {"overall", "overall_new"}:
+        raise ValueError("ground_truth_field must be 'overall' or 'overall_new'")
     dataset_path = Path(json_file)
-    split_dir = dataset_path.parent / "splits" / dataset_path.stem
+    split_dir = split_directory(dataset_path, seed, split_profile)
     paths = {
         "train": split_dir / "train.json",
         "validation": split_dir / "val.json",
@@ -69,9 +81,12 @@ def create_dataframes(
             or frames[name]["overall_new"].isna().any()
         ):
             raise ValueError(f"{paths[name]} must contain non-null overall_new")
-    if "overall_new" in frames["test"].columns:
+    if (
+        ground_truth_field not in frames["test"]
+        or frames["test"][ground_truth_field].isna().any()
+    ):
         raise ValueError(
-            f"{paths['test']} must not contain overall_new; test ground truth is overall"
+            f"{paths['test']} must contain non-null {ground_truth_field}"
         )
 
     train_frame = frames["train"].reset_index(drop=True)

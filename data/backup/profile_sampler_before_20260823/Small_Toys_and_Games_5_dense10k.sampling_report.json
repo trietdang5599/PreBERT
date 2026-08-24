@@ -1,0 +1,22 @@
+{
+  "reviews": 10000,
+  "users": 1190,
+  "items": 486,
+  "density": 0.01729086696406958,
+  "min_reviews_per_user": 5,
+  "median_reviews_per_user": 7.0,
+  "min_reviews_per_item": 5,
+  "median_reviews_per_item": 18.0,
+  "rating_distribution": {
+    "1.0": 178,
+    "2.0": 375,
+    "3.0": 1106,
+    "4.0": 2969,
+    "5.0": 5372
+  },
+  "source_url": "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Toys_and_Games_5.json.gz",
+  "source_cache": "data/raw/reviews_Toys_and_Games_5.json.gz",
+  "output": "data/Small_Toys_and_Games_5_dense10k.json",
+  "seed": 2026,
+  "k_core": 5
+}

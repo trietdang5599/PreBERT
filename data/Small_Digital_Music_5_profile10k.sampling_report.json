@@ -1,0 +1,37 @@
+{
+  "reviews": 10000,
+  "users": 5319,
+  "items": 2882,
+  "density": 0.0006523430400673009,
+  "mean_reviews_per_user": 1.8800526414739613,
+  "mean_reviews_per_item": 3.4698126301179735,
+  "min_reviews_per_user": 1,
+  "median_reviews_per_user": 1.0,
+  "min_reviews_per_item": 1,
+  "median_reviews_per_item": 2.0,
+  "rating_distribution": {
+    "1.0": 436,
+    "2.0": 458,
+    "3.0": 1030,
+    "4.0": 2492,
+    "5.0": 5584
+  },
+  "source_url": "https://snap.stanford.edu/data/amazon/productGraph/categoryFiles/reviews_Digital_Music_5.json.gz",
+  "source_cache": "data/raw/reviews_Digital_Music_5.json.gz",
+  "output": "data/Small_Digital_Music_5_profile10k.json",
+  "seed": 2026,
+  "k_core": 5,
+  "sampling_profile": "digital-music",
+  "profile_targets": {
+    "users": 5319,
+    "items": 2882,
+    "reviews_per_user": 1.88,
+    "reviews_per_item": 3.47
+  },
+  "profile_deviation": {
+    "users": 0,
+    "items": 0,
+    "reviews_per_user": 5.2641473961445584e-05,
+    "reviews_per_item": -0.00018736988202672222
+  }
+}
