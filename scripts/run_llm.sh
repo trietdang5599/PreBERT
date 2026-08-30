@@ -7,18 +7,23 @@ DATASETS=(
   "data/Small_Digital_Music_5_llama_filtered.json"
   "data/Small_Toys_and_Games_5_llama_filtered.json"
 )
-# Full thesis matrix: 3 datasets x 4 models x 4 preprocessing modes.
+# Full thesis matrix: 3 datasets x 4 models x 3 evaluation conditions.
+# 1) raw reviewText / overall
+# 2) filteredReviewText / overall
+# 3) filteredReviewText / overall_new
 MODELS=(qwen2.5_3b qwen-3b llama3.2_1b llama3.2_3b)
-MODES=(pretrained-processed pretrained pretrained-processed-mix pretrained-rating-only)
+MODES=(pretrained pretrained-processed-mix pretrained-processed)
 SEED=42
 TRAIN_RATIO=0.8
 VAL_RATIO=0.1
 TEST_RATIO=0.1
+# Empty: each mode uses its own label; set overall/overall_new to override all.
+GROUND_TRUTH_FIELD=""
 MAX_LENGTH=512
 MAX_NEW_TOKENS=8
 INFERENCE_BATCH_SIZE=1
 OUTPUT_DIR="experiments/outputs"
-FORCE=false
+FORCE=true
 DRY_RUN=false
 KEEP_GOING=false
 MAX_TRAIN_SAMPLES=""                 # Empty means no limit.
@@ -45,8 +50,7 @@ fi
 # Backward-compatible optional preset override from the command line.
 if [[ $# -gt 0 && "${1}" != --* ]]; then
   case "${1}" in
-    main) MODES=(pretrained pretrained-processed) ;;
-    ablation) MODES=(pretrained pretrained-processed-mix pretrained-rating-only pretrained-processed) ;;
+    main|ablation) MODES=(pretrained pretrained-processed-mix pretrained-processed) ;;
     baseline) MODES=(pretrained) ;;
     processed) MODES=(pretrained-processed) ;;
     *) echo "Unknown LLM preset: ${1}" >&2; exit 2 ;;
@@ -68,6 +72,7 @@ COMMAND=(
   --inference-batch-size "${INFERENCE_BATCH_SIZE}"
   --output-dir "${OUTPUT_DIR}"
 )
+[[ -n "${GROUND_TRUTH_FIELD}" ]] && COMMAND+=(--ground-truth-field "${GROUND_TRUTH_FIELD}")
 [[ "${FORCE}" == true ]] && COMMAND+=(--force)
 [[ "${DRY_RUN}" == true ]] && COMMAND+=(--dry-run)
 [[ "${KEEP_GOING}" == true ]] && COMMAND+=(--keep-going)

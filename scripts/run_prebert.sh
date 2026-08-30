@@ -4,10 +4,10 @@ set -euo pipefail
 # ========================= USER CONFIGURATION =========================
 # Full thesis suite. Keep only selected entries to run a subset.
 # MODES=(main preprocessing-ablation clustering-ablation encoder-ablation rec-feature-ablation)
-MODES=(main preprocessing-ablation clustering-ablation encoder-ablation rec-feature-ablation)
+MODES=(preprocessing-ablation)
 DATASETS=(
-  Small_All_Beauty_5_llama_filtered
-  Small_Digital_Music_5_llama_filtered
+  # Small_All_Beauty_5_llama_filtered
+  # Small_Digital_Music_5_llama_filtered
   Small_Toys_and_Games_5_llama_filtered
 )
 SEEDS=(42)
@@ -33,7 +33,7 @@ MAX_TOPICS_PER_WORD=10
 CACHE_ROOT="chkpt/clustering_ablation"
 OUTPUT_DIR="results/clustering_ablation"
 FORCE_BERT=false
-FORCE_RESULTS=false
+FORCE_RESULTS=true
 KEEP_GOING=false
 DRY_RUN=false
 # ======================================================================

@@ -1812,8 +1812,10 @@ def _source_candidates(processed_path: Path) -> list[Path]:
         dict.fromkeys(
             (
                 processed_path.with_name(f"{base}.json"),
+                processed_path.with_name(f"{base}_profile10k.json"),
                 processed_path.with_name(f"{base}_dense10k.json"),
                 processed_path.parent / "backup" / f"{base}.json",
+                processed_path.parent / "backup" / f"{base}_profile10k.json",
                 processed_path.parent / "backup" / f"{base}_dense10k.json",
             )
         )

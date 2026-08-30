@@ -62,6 +62,11 @@ def matrix_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-dir", type=Path, default=Path("experiments/outputs"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--ground-truth-field",
+        choices=(GROUND_TRUTH_FIELD, "overall_new"),
+        help="Override the rating field normally selected by each mode.",
+    )
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--inference-batch-size", type=int, default=1)
     parser.add_argument("--force", action="store_true")
@@ -76,18 +81,21 @@ def matrix_parser() -> argparse.ArgumentParser:
 
 
 def expected_metrics_path(
-    output_dir: Path, dataset: Path, model_id: str, mode: str
+    output_dir: Path, dataset: Path, model_id: str, mode: str, ground_truth_field: str
 ) -> Path:
-    return (
+    path = (
         output_dir
         / dataset.stem
         / model_id.replace("/", "--")
         / mode
         / "metrics.json"
     )
+    if ground_truth_field != GROUND_TRUTH_FIELD:
+        path = path.parent / f"gt-{ground_truth_field}" / "metrics.json"
+    return path
 
 
-def is_completed_rating_run(metrics_path: Path) -> bool:
+def is_completed_rating_run(metrics_path: Path, ground_truth_field: str) -> bool:
     """Return true only for results using the current ground-truth contract."""
     config_path = metrics_path.with_name("run_config.json")
     if not metrics_path.is_file() or not config_path.is_file():
@@ -97,7 +105,7 @@ def is_completed_rating_run(metrics_path: Path) -> bool:
     except (OSError, ValueError):
         return False
     return (
-        config.get("ratingField") == GROUND_TRUTH_FIELD
+        config.get("ratingField") == ground_truth_field
         and config.get("splitBeforePreprocessing") is True
     )
 
@@ -128,12 +136,19 @@ def rating_command(
         "--inference-batch-size",
         str(args.inference_batch_size),
     ]
+    if args.ground_truth_field is not None:
+        command.extend(("--ground-truth-field", args.ground_truth_field))
     extra_args = (
         args.extra_args[1:]
         if args.extra_args[:1] == ["--"]
         else args.extra_args
     )
     return command + extra_args
+
+
+def mode_ground_truth_field(args: argparse.Namespace, mode: str) -> str:
+    """Return the per-mode label unless the matrix explicitly overrides it."""
+    return args.ground_truth_field or MODE_FIELDS[mode][1]
 
 
 def run_rating_matrix(argv: Sequence[str]) -> None:
@@ -167,10 +182,11 @@ def run_rating_matrix(argv: Sequence[str]) -> None:
         for model_alias, model_id in models:
             for mode in modes:
                 position += 1
+                ground_truth_field = mode_ground_truth_field(args, mode)
                 metrics_path = expected_metrics_path(
-                    args.output_dir, dataset, model_id, mode
+                    args.output_dir, dataset, model_id, mode, ground_truth_field
                 )
-                if is_completed_rating_run(metrics_path) and not args.force:
+                if is_completed_rating_run(metrics_path, ground_truth_field) and not args.force:
                     print(f"\n[{position}/{total}] Skip completed: {metrics_path}")
                     skipped += 1
                     continue

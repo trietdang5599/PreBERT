@@ -81,6 +81,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="pretrained",
         help="Experiment type and fields to use",
     )
+    parser.add_argument(
+        "--ground-truth-field",
+        choices=(GROUND_TRUTH_FIELD, "overall_new"),
+        help=(
+            "Override the mode's default rating field for splitting and "
+            "evaluation. Omit to use the mode-specific field."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("experiments/outputs"))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -171,8 +179,10 @@ def source_dataset_candidates(processed_path: Path) -> list[Path]:
     base = processed_path.stem[: -len(suffix)]
     candidates = [
         processed_path.with_name(f"{base}.json"),
+        processed_path.with_name(f"{base}_profile10k.json"),
         processed_path.with_name(f"{base}_dense10k.json"),
         processed_path.parent / "backup" / f"{base}.json",
+        processed_path.parent / "backup" / f"{base}_profile10k.json",
         processed_path.parent / "backup" / f"{base}_dense10k.json",
     ]
     return list(dict.fromkeys(candidates))
@@ -254,21 +264,49 @@ def prepare_source_rows(
     return rows
 
 
-def processed_text_lookup(
-    processed_rows: Sequence[dict[str, Any]], text_field: str
-) -> dict[tuple[tuple[Any, ...], int], str]:
-    """Index processed text while preserving repeated interaction occurrences."""
+def processed_field_lookup(
+    processed_rows: Sequence[dict[str, Any]], field: str
+) -> dict[tuple[tuple[Any, ...], int], Any]:
+    """Index one processed field while preserving repeated interactions."""
     lookup = {}
     occurrences: Counter[tuple[Any, ...]] = Counter()
     for raw in processed_rows:
         key = mapping_key(raw)
         occurrence = occurrences[key]
         occurrences[key] += 1
-        text = raw.get(text_field)
-        if not isinstance(text, str) or not text.strip():
+        value = raw.get(field)
+        if isinstance(value, str):
+            value = value.strip()
+        if value is None or value == "":
             continue
-        lookup[(key, occurrence)] = text.strip()
+        lookup[(key, occurrence)] = value
     return lookup
+
+
+def apply_processed_ratings(
+    source_rows: Sequence[dict[str, Any]],
+    rating_lookup: dict[tuple[tuple[Any, ...], int], Any],
+    rating_field: str,
+) -> list[dict[str, Any]]:
+    """Replace source ratings with validated labels from processed rows."""
+    mapped = []
+    for row in source_rows:
+        result = dict(row)
+        mapping_id = result["_mapping_id"]
+        try:
+            numeric_rating = float(rating_lookup[mapping_id])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"No valid {rating_field} value mapped to {mapping_id!r}"
+            ) from exc
+        integer_rating = int(numeric_rating)
+        if numeric_rating != integer_rating or integer_rating not in range(1, 6):
+            raise ValueError(
+                f"Invalid {rating_field}={numeric_rating!r} for {mapping_id!r}"
+            )
+        result["rating"] = integer_rating
+        mapped.append(result)
+    return mapped
 
 
 def map_split_text(
@@ -291,9 +329,10 @@ def map_split_text(
 
 def validate_test_contract(
     test_rows: Sequence[dict[str, Any]],
-    source_rows: Sequence[dict[str, Any]],
+    expected_ratings: dict[int, int],
+    rating_field: str,
 ) -> None:
-    """Ensure test labels still come from the original, unprocessed dataset."""
+    """Ensure test labels match the explicitly selected ground-truth field."""
     expected_fields = {"source_index", "text", "rating"}
     for row in test_rows:
         if set(row) != expected_fields:
@@ -303,16 +342,15 @@ def validate_test_contract(
             )
         source_index = row["source_index"]
         try:
-            original_rating = float(source_rows[source_index][GROUND_TRUTH_FIELD])
-        except (IndexError, KeyError, TypeError, ValueError) as exc:
+            expected_rating = expected_ratings[source_index]
+        except KeyError as exc:
             raise RuntimeError(
-                f"Cannot verify original rating for test source_index={source_index}"
+                f"Cannot verify {rating_field} for test source_index={source_index}"
             ) from exc
-        if row["rating"] != original_rating:
+        if row["rating"] != expected_rating:
             raise RuntimeError(
-                "Test ground truth changed during preprocessing at "
-                f"source_index={source_index}: expected original "
-                f"{GROUND_TRUTH_FIELD}={original_rating}, got {row['rating']}"
+                f"Test ground truth mismatch at source_index={source_index}: "
+                f"expected {rating_field}={expected_rating}, got {row['rating']}"
             )
 
 
@@ -473,6 +511,24 @@ def rating_token_id_map(tokenizer: Any) -> dict[int, int]:
     return token_map
 
 
+def constrained_rating_from_tokens(
+    generated_token_ids: Sequence[int],
+    rating_tokens: dict[int, int],
+    raw_output: str,
+) -> tuple[int, bool]:
+    """Read a constrained rating without assuming generation always complies.
+
+    A few generation backends can append a padding/special token even when a
+    prefix constraint is supplied.  Such a token must be reported as an
+    invalid prediction instead of crashing evaluation with ``KeyError``.
+    """
+    for token_id in generated_token_ids:
+        rating = rating_tokens.get(int(token_id))
+        if rating is not None:
+            return rating, True
+    return parse_rating(raw_output)
+
+
 def batched(rows: Sequence[dict[str, Any]], size: int) -> Iterable[Sequence[dict[str, Any]]]:
     for start in range(0, len(rows), size):
         yield rows[start : start + size]
@@ -532,8 +588,9 @@ def predict(
         texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
         for position, (row, raw_output) in enumerate(zip(batch, texts)):
             if args.constrain_rating_output:
-                prediction = rating_tokens[int(new_tokens[position, 0].item())]
-                valid = True
+                prediction, valid = constrained_rating_from_tokens(
+                    new_tokens[position].tolist(), rating_tokens, raw_output
+                )
             else:
                 prediction, valid = parse_rating(raw_output)
             results.append(
@@ -583,20 +640,28 @@ def calculate_metrics(predictions: Sequence[dict[str, Any]]) -> dict[str, Any]:
 def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     model_id = resolve_model_id(args.model)
-    text_field, _ = MODE_FIELDS[args.mode]
-    rating_field = GROUND_TRUTH_FIELD
+    text_field, default_rating_field = MODE_FIELDS[args.mode]
+    rating_field = args.ground_truth_field or default_rating_field
     processed_rows = read_json_objects(args.dataset)
     split_dataset, source_objects = resolve_split_dataset(
         args.dataset, args.split_dataset, processed_rows
     )
-    source_rows = prepare_source_rows(source_objects, rating_field)
+    # Review identity and source discovery always use original ``overall``;
+    # adjusted ``overall_new`` exists only after preprocessing.
+    source_rows = prepare_source_rows(source_objects, GROUND_TRUTH_FIELD)
+    if rating_field != GROUND_TRUTH_FIELD:
+        source_rows = apply_processed_ratings(
+            source_rows,
+            processed_field_lookup(processed_rows, rating_field),
+            rating_field,
+        )
     train_source, val_source, test_source = stratified_split(
         source_rows, args.train_ratio, args.val_ratio, args.seed
     )
     text_lookup = (
         None
         if text_field == "reviewText"
-        else processed_text_lookup(processed_rows, text_field)
+        else processed_field_lookup(processed_rows, text_field)
     )
     train_rows = map_split_text(train_source, text_lookup)
     val_rows = map_split_text(val_source, text_lookup)
@@ -604,11 +669,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     train_rows = limit_rows(train_rows, args.max_train_samples)
     val_rows = limit_rows(val_rows, args.max_val_samples)
     test_rows = limit_rows(test_rows, args.max_test_samples)
-    validate_test_contract(test_rows, source_objects)
+    expected_ratings = {
+        int(row["source_index"]): int(row["rating"]) for row in source_rows
+    }
+    validate_test_contract(test_rows, expected_ratings, rating_field)
 
     dataset_name = args.dataset.stem
     safe_model_name = model_id.replace("/", "--")
     run_dir = args.output_dir / dataset_name / safe_model_name / args.mode
+    if rating_field != GROUND_TRUTH_FIELD:
+        run_dir = run_dir / f"gt-{rating_field}"
     run_dir.mkdir(parents=True, exist_ok=True)
     split_dir = run_dir / "splits"
     write_jsonl(split_dir / "train.jsonl", train_rows)
@@ -625,7 +695,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "constrainRatingOutput": args.constrain_rating_output,
         "textField": text_field,
         "ratingField": rating_field,
-        "testRatingPolicy": "original-overall",
+        "testRatingPolicy": rating_field,
         "predictionInputField": text_field,
         "seed": args.seed,
         "splitRatios": {
@@ -662,7 +732,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             "splitDataset": str(split_dataset),
             "splitBeforePreprocessing": True,
             "groundTruthField": rating_field,
-            "testRatingPolicy": "original-overall",
+            "testRatingPolicy": rating_field,
             "predictionInputField": text_field,
         }
     )

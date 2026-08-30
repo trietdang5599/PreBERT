@@ -26,21 +26,21 @@ MODEL_ALIASES = {
 
 GROUND_TRUTH_FIELD = "overall"
 
-# Evaluation always measures predictions against the original Amazon rating.
-# Mode names are retained for compatibility with existing commands and output
-# paths; they now vary only the review text presented to the model.
+# Each mode isolates one of the two preprocessing outputs: filtered review text
+# and reassessed rating. The runner may explicitly override this label for a
+# dedicated ground-truth experiment.
 MODE_FIELDS = {
     "pretrained": ("reviewText", GROUND_TRUTH_FIELD),
-    "pretrained-processed": ("filteredReviewText", GROUND_TRUTH_FIELD),
+    "pretrained-rating-only": ("reviewText", "overall_new"),
+    "pretrained-processed": ("filteredReviewText", "overall_new"),
     "pretrained-processed-mix": ("filteredReviewText", GROUND_TRUTH_FIELD),
-    "pretrained-rating-only": ("reviewText", GROUND_TRUTH_FIELD),
 }
 
 MODE_DESCRIPTIONS = {
     "pretrained": "baseline: original review text + original rating",
-    "pretrained-processed-mix": "text-only ablation: filtered text + original rating",
-    "pretrained-rating-only": "legacy alias: original text + original ground truth",
-    "pretrained-processed": "filtered text + original ground truth",
+    "pretrained-processed-mix": "filtered text + original rating",
+    "pretrained-rating-only": "original text + reassessed rating",
+    "pretrained-processed": "filtered text + reassessed rating",
 }
 
 DEFAULT_DATASETS = (
